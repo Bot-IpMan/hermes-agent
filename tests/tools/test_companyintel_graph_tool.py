@@ -287,6 +287,12 @@ def test_run_service_transition_is_durable_and_fail_closed(companyintel_home):
     assert [event["event"] for event in replay["events"]] == ["run.started", "run.status", "run.status"]
     assert [event["payload"].get("to", event["payload"].get("status")) for event in replay["events"]] == ["RUNNING", "RETRY_WAIT", "RESUMABLE"]
 
+    orphan_init = json.loads(companyintel_graph({"action": "init_run", "run_id": "run_service_orphan", "target_url": "https://example.com"}))
+    orphan_resumable = json.loads(companyintel_graph({"action": "transition_run", "run_id": "run_service_orphan", "status": "RESUMABLE", "reason": "gateway restarted"}))
+    assert orphan_init["ok"] is True
+    assert orphan_resumable["ok"] is True
+    assert orphan_resumable["from"] == "RUNNING"
+
     invalid = json.loads(companyintel_graph({
         "action": "transition_run", "run_id": "run_service_002", "status": "COMPLETED",
     }))

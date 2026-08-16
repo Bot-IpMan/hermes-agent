@@ -47,6 +47,7 @@ import hashlib
 import hmac
 import itertools
 import json
+from datetime import datetime
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from functools import wraps
@@ -6992,7 +6993,14 @@ class APIServerAdapter(BasePlatformAdapter):
                                         break
                                 frontier_summary = json.loads(companyintel_graph({"action": "summary", "run_id": run_id}))
                                 if frontier_summary.get("status") in {"RETRY_WAIT", "RESUMABLE", "PARTIAL"} and frontier_summary.get("frontier_open", 0) > 0:
-                                    return {"final_response": "CompanyIntel durable execution paused for bounded retry/resume.", "review_text": "", "deferred": True, "reason": frontier_summary.get("retry_reason") or frontier_summary.get("saturation_reason")}, {}
+                                    saturation_reason = str(frontier_summary.get("saturation_reason") or "")
+                                    return {
+                                        "final_response": "CompanyIntel durable execution paused for bounded retry/resume.",
+                                        "review_text": "",
+                                        "deferred": True,
+                                        "partial": saturation_reason.startswith("BUDGET_EXHAUSTED:"),
+                                        "reason": frontier_summary.get("retry_reason") or saturation_reason,
+                                    }, {}
                                 report_result = json.loads(companyintel_graph({
                                     "action": "generate_report",
                                     "run_id": run_id,
@@ -7104,9 +7112,18 @@ class APIServerAdapter(BasePlatformAdapter):
                 else:
                     if request_profile == "companyintel" and isinstance(result, dict) and result.get("deferred"):
                         deferred_reason = _redact_api_error_text(result.get("reason") or "companyintel durable retry/resume pending")
-                        self._set_run_status(run_id, "retry_wait", error=deferred_reason, last_event="run.retry_wait")
-                        _put_event_if_active({"event": "run.retry_wait", "run_id": run_id, "timestamp": time.time(), "error": deferred_reason})
-                        _companyintel_transition_graph(run_id, request_profile, "RETRY_WAIT", deferred_reason)
+                        is_partial = bool(result.get("partial"))
+                        api_status = "partial" if is_partial else "retry_wait"
+                        graph_status = "PARTIAL" if is_partial else "RETRY_WAIT"
+                        event_name = "run.partial" if is_partial else "run.retry_wait"
+                        self._set_run_status(run_id, api_status, error=deferred_reason, last_event=event_name)
+                        _put_event_if_active({"event": event_name, "run_id": run_id, "timestamp": time.time(), "error": deferred_reason})
+                        transition_error = _companyintel_transition_graph(run_id, request_profile, graph_status, deferred_reason)
+                        if transition_error:
+                            transition_error = _redact_api_error_text(transition_error)
+                            logger.error("CompanyIntel deferred lifecycle transition failed for %s: %s", run_id, transition_error)
+                            self._set_run_status(run_id, "failed", error=transition_error, last_event="run.failed")
+                            _put_event_if_active({"event": "run.failed", "run_id": run_id, "timestamp": time.time(), "error": transition_error})
                         return
                     gate_error = _companyintel_pre_report_gate(run_id, request_profile)
                     if gate_error:
@@ -7364,6 +7381,46 @@ class APIServerAdapter(BasePlatformAdapter):
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"),
                 status=404,
             )
+        # The SQLite/API status index can survive a gateway restart while the
+        # CompanyIntel graph remains the authoritative owner of lifecycle state.
+        # Reconcile it on read so an orphaned RUNNING run becomes resumable and
+        # the UI cannot keep showing a stale retry_wait/history projection.
+        try:
+            from tools.companyintel_graph_tool import companyintel_graph
+            with self._profile_scope("companyintel"):
+                graph_summary = json.loads(companyintel_graph({"action": "summary", "run_id": run_id}))
+            if graph_summary.get("ok"):
+                graph_status = str(graph_summary.get("status") or "").upper()
+                if graph_status == "RUNNING" and run_id not in self._active_run_tasks:
+                    raw_updated = graph_summary.get("updated_at")
+                    try:
+                        updated_epoch = datetime.fromisoformat(str(raw_updated).replace("Z", "+00:00")).timestamp()
+                    except (TypeError, ValueError, OverflowError):
+                        updated_epoch = time.time()
+                    if time.time() - updated_epoch > 60:
+                        recovery_reason = "gateway restarted while CompanyIntel checkpoint was active"
+                        with self._profile_scope("companyintel"):
+                            recovery_error = _companyintel_transition_graph(run_id, "companyintel", "RESUMABLE", recovery_reason)
+                            if not recovery_error:
+                                graph_summary = json.loads(companyintel_graph({"action": "summary", "run_id": run_id}))
+                        if recovery_error:
+                            logger.error("CompanyIntel orphan recovery failed for %s: %s", run_id, recovery_error)
+                        else:
+                            graph_status = str(graph_summary.get("status") or "").upper()
+                            status = self._set_run_status(run_id, "resumable", error=recovery_reason, last_event="run.resumable")
+                if graph_status:
+                    status = dict(status)
+                    status["profile"] = "companyintel"
+                    status["status"] = graph_status.lower()
+                    status["updated_at"] = status.get("updated_at") or time.time()
+                    if graph_status == "RETRY_WAIT":
+                        status["error"] = graph_summary.get("retry_reason") or status.get("error")
+                    elif graph_status == "PARTIAL":
+                        status["error"] = graph_summary.get("saturation_reason") or status.get("error")
+        except Exception:
+            # Generic runs do not have a CompanyIntel graph. Their existing
+            # status contract remains authoritative and must not be rerouted.
+            logger.debug("CompanyIntel status reconciliation skipped for %s", run_id, exc_info=True)
         if (
             str(status.get("status") or "").lower() == "completed"
             and (
