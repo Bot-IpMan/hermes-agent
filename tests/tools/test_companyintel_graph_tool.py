@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -36,6 +37,26 @@ def test_init_run_persists_canonical_graph_and_checkpoint(companyintel_home):
     assert graph["schema_version"] == "corporate-intelligence-graph/v2"
     assert graph["target"]["domain"] == "example.com"
     assert graph["research_state"]["status"] == "RUNNING"
+
+
+def test_concurrent_projection_and_event_access_does_not_lock_database(companyintel_home):
+    from tools.companyintel_graph_tool import companyintel_graph
+
+    run_id = "run_concurrent_sqlite_001"
+    init = json.loads(companyintel_graph({"action": "init_run", "run_id": run_id, "target_url": "https://example.com"}))
+    assert init["ok"] is True
+
+    actions = [
+        {"action": "summary", "run_id": run_id},
+        {"action": "projection", "run_id": run_id, "view": "graph"},
+        {"action": "projection", "run_id": run_id, "view": "frontier"},
+        {"action": "projection", "run_id": run_id, "view": "evidence"},
+        {"action": "append_event", "run_id": run_id, "event_type": "run.status", "payload": {"status": "running"}, "idempotency_key": "concurrent-status"},
+    ]
+    with ThreadPoolExecutor(max_workers=len(actions)) as pool:
+        results = list(pool.map(companyintel_graph, actions))
+    decoded = [json.loads(result) for result in results]
+    assert all(result.get("ok") is True for result in decoded), decoded
 
 
 def test_observation_creates_durable_node_evidence_edge_and_typed_frontier(companyintel_home):

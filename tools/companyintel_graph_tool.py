@@ -92,9 +92,14 @@ def _connect(run_id: str) -> sqlite3.Connection:
     db_path = run_dir / "graph.sqlite3"
     preexisting_db = db_path.exists()
     run_dir.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path, timeout=15)
+    conn = sqlite3.connect(db_path, timeout=60)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=60000")
+    # Existing run databases are already WAL-enabled. Re-applying the journal
+    # mode on every projection/event connection takes a writer lock and races
+    # with run startup. Only bootstrap a new database here.
+    if not preexisting_db:
+        conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(
         """
