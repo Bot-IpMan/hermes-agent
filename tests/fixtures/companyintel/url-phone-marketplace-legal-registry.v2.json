@@ -1,0 +1,178 @@
+{
+  "schema_version": "corporate-intelligence-graph/v2",
+  "target": {
+    "url": "https://example.test",
+    "domain": "example.test"
+  },
+  "research_state": {
+    "status": "COMPLETED",
+    "round": 1,
+    "frontier_open": 0
+  },
+  "nodes": [
+    {
+      "node_id": "node-3f92cf1b40b68b1f",
+      "node_type": "url",
+      "value": "https://example.test",
+      "normalized_value": "https://example.test",
+      "status": "OBSERVED",
+      "confidence": 0.9,
+      "evidence_ids": [
+        "e-chain"
+      ],
+      "discovered_from": [],
+      "first_seen_round": 0,
+      "last_expanded_round": 0,
+      "frontier_state": "EXHAUSTED"
+    },
+    {
+      "node_id": "node-3eb9169252930aee",
+      "node_type": "phone",
+      "value": "+380501234567",
+      "normalized_value": "+380501234567",
+      "status": "OBSERVED",
+      "confidence": 0.9,
+      "evidence_ids": [
+        "e-chain"
+      ],
+      "discovered_from": [],
+      "first_seen_round": 0,
+      "last_expanded_round": 0,
+      "frontier_state": "EXHAUSTED"
+    },
+    {
+      "node_id": "node-f6ca2b8c8019e2ce",
+      "node_type": "marketplace_profile",
+      "value": "https://market.example.test/acme",
+      "normalized_value": "https://market.example.test/acme",
+      "status": "OBSERVED",
+      "confidence": 0.9,
+      "evidence_ids": [
+        "e-chain"
+      ],
+      "discovered_from": [],
+      "first_seen_round": 0,
+      "last_expanded_round": 0,
+      "frontier_state": "EXHAUSTED"
+    },
+    {
+      "node_id": "node-547aee941baef214",
+      "node_type": "legal_entity_candidate",
+      "value": "Acme LLC",
+      "normalized_value": "Acme LLC",
+      "status": "OBSERVED",
+      "confidence": 0.9,
+      "evidence_ids": [
+        "e-chain"
+      ],
+      "discovered_from": [],
+      "first_seen_round": 0,
+      "last_expanded_round": 0,
+      "frontier_state": "EXHAUSTED"
+    },
+    {
+      "node_id": "node-e59a4c3748d0f5cf",
+      "node_type": "official_registry",
+      "value": "UA-EDRPOU-12345678",
+      "normalized_value": "UA-EDRPOU-12345678",
+      "status": "OBSERVED",
+      "confidence": 0.9,
+      "evidence_ids": [
+        "e-chain"
+      ],
+      "discovered_from": [],
+      "first_seen_round": 0,
+      "last_expanded_round": 0,
+      "frontier_state": "EXHAUSTED"
+    }
+  ],
+  "edges": [
+    {
+      "edge_id": "edge-1518dcb1e72f2220",
+      "from_node": "node-3f92cf1b40b68b1f",
+      "to_node": "node-3eb9169252930aee",
+      "relation": "publishes",
+      "confidence": 0.9,
+      "evidence_ids": [
+        "e-chain"
+      ],
+      "first_seen_round": 0
+    },
+    {
+      "edge_id": "edge-954222b382106d82",
+      "from_node": "node-3eb9169252930aee",
+      "to_node": "node-f6ca2b8c8019e2ce",
+      "relation": "listed_on",
+      "confidence": 0.9,
+      "evidence_ids": [
+        "e-chain"
+      ],
+      "first_seen_round": 0
+    },
+    {
+      "edge_id": "edge-0eed6bdc473a460d",
+      "from_node": "node-f6ca2b8c8019e2ce",
+      "to_node": "node-547aee941baef214",
+      "relation": "maps_to",
+      "confidence": 0.9,
+      "evidence_ids": [
+        "e-chain"
+      ],
+      "first_seen_round": 0
+    },
+    {
+      "edge_id": "edge-ae0bbc6d04af748b",
+      "from_node": "node-547aee941baef214",
+      "to_node": "node-e59a4c3748d0f5cf",
+      "relation": "registered_as",
+      "confidence": 0.9,
+      "evidence_ids": [
+        "e-chain"
+      ],
+      "first_seen_round": 0
+    }
+  ],
+  "evidence": [
+    {
+      "evidence_id": "e-chain",
+      "source_url": "https://example.test/contact",
+      "retrieved_at": "2026-01-01T00:00:00Z",
+      "excerpt": "bounded fixture evidence",
+      "content_sha256": "db957f83d8b98bd3311223e05d9ca02e47d96bf5d1c42fc3ed9769c12cce5f4c",
+      "source_title": "Fixture",
+      "source_tier": "A",
+      "retrieval_method": "fixture",
+      "access_status": "success"
+    }
+  ],
+  "frontier": [],
+  "frontier_tasks": [],
+  "search_log": [
+    {
+      "search_id": "s-chain",
+      "round": 0,
+      "pivot_node_id": "node-3f92cf1b40b68b1f",
+      "pivot_type": "fixture",
+      "query": "fixture",
+      "source": "fixture",
+      "status": "COMPLETED",
+      "new_node_ids": [
+        "node-3eb9169252930aee",
+        "node-f6ca2b8c8019e2ce",
+        "node-547aee941baef214",
+        "node-e59a4c3748d0f5cf"
+      ]
+    }
+  ],
+  "identity_resolution": {
+    "status": "CONFIRMED",
+    "candidate_ids": [
+      "node-547aee941baef214"
+    ]
+  },
+  "identity_candidates": [],
+  "worker_checkpoints": [],
+  "pivot_coverage": {
+    "fixture": "COMPLETED_WITH_RESULTS"
+  }
+}

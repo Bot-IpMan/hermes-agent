@@ -16,9 +16,10 @@ Exposes an HTTP server with endpoints:
 - POST /api/sessions/{session_id}/chat[/stream] — chat with a persisted session
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
 - GET  /v1/runs/{run_id}           — retrieve current run status
+- POST /v1/runs/{run_id}/resume    — resume durable CompanyIntel frontier from checkpoint
+- GET  /v1/runs/{run_id}/{view}    — graph/frontier/evidence durable projections (report gate is fail-closed)
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
 - POST /v1/runs/{run_id}/approval — resolve a pending run approval
-- POST /v1/runs/{run_id}/steer      — inject guidance into a running agent
 - POST /v1/runs/{run_id}/stop       — interrupt a running agent
 - GET  /health                     — health check
 - GET  /health/detailed            — rich status for cross-container dashboard probing
@@ -46,7 +47,7 @@ import hashlib
 import hmac
 import itertools
 import json
-from contextlib import contextmanager, nullcontext, suppress
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from functools import wraps
 import logging
@@ -75,6 +76,132 @@ def _approval_event_choices(*, smart_denied: bool, allow_permanent: bool) -> lis
     if smart_denied:
         return ["once", "deny"]
     return ["once", "session", "always", "deny"] if allow_permanent else ["once", "session", "deny"]
+
+
+def _companyintel_target_url_from_message(message: Any) -> Optional[str]:
+    """Extract the backend's explicit target_url without trusting free-form prose."""
+    if not isinstance(message, str):
+        return None
+    match = re.search(r"(?im)^target_url:\s*(https?://[^\s]+)", message)
+    return match.group(1).rstrip(".,)") if match else None
+
+
+def _companyintel_target_url_from_request(body: dict[str, Any], message: Any) -> Optional[str]:
+    target_url = body.get("target_url")
+    if isinstance(target_url, str) and target_url.strip():
+        return target_url.strip()
+    return _companyintel_target_url_from_message(message)
+
+
+def _companyintel_effective_request_profile(explicit_profile: Any) -> Optional[str]:
+    """Resolve the dedicated profile even when a legacy client omits it.
+
+    A gateway launched from the ``companyintel`` profile must not silently
+    downgrade `/v1/runs` into the generic conversation loop merely because an
+    older client encoded the profile only in its endpoint configuration.
+    """
+    if isinstance(explicit_profile, str) and explicit_profile.strip():
+        return explicit_profile.strip()
+    scoped = _api_request_profile.get()
+    if scoped:
+        return scoped
+    env_profile = os.environ.get("HERMES_PROFILE", "").strip()
+    if env_profile:
+        return env_profile
+    hermes_home = os.environ.get("HERMES_HOME", "").strip()
+    if hermes_home and Path(hermes_home).name == "companyintel":
+        return "companyintel"
+    return None
+
+
+def _companyintel_incomplete_output_reason(output: Any) -> Optional[str]:
+    """Reject narrative partial/blocker responses as successful reports."""
+    if not isinstance(output, str) or not output.strip():
+        return "CompanyIntel produced no validated report"
+    prefix = output.strip()[:1200].upper()
+    markers = (
+        "BLOCKED / RESUMABLE",
+        "PARTIAL_RESUMABLE",
+        "STATUS: BLOCKED",
+        "СТАТУС: BLOCKED",
+        "PARTIAL:",
+        "НЕ ПОВНИЙ ЗВІТ",
+    )
+    if any(marker in prefix for marker in markers):
+        return "CompanyIntel quality gate rejected an incomplete or blocked result"
+    return None
+
+
+def _companyintel_effective_gateway_timeout(profile: Optional[str], configured_timeout: float) -> float:
+    """Do not kill durable CompanyIntel runs at the operator idle timeout.
+
+    CompanyIntel owns its wall-clock deadline in the durable graph ``run_state``.
+    The generic gateway timeout is an HTTP/agent-turn guard and is too coarse for
+    a run that intentionally survives provider idle/retry windows.
+    """
+    if profile == "companyintel":
+        return 0.0
+    return max(0.0, float(configured_timeout))
+
+
+def _companyintel_initialize_graph(run_id: str, message: Any, *, target_url: Optional[str] = None) -> Optional[str]:
+    """Create the authoritative graph before the first model/tool call."""
+    target_url = target_url or _companyintel_target_url_from_message(message)
+    if not target_url:
+        return "companyintel run is missing explicit target_url"
+    try:
+        from tools.companyintel_graph_tool import companyintel_graph
+        result = json.loads(companyintel_graph({"action": "init_run", "run_id": run_id, "target_url": target_url}))
+        if not result.get("ok"):
+            return result.get("error", "graph initialization failed")
+    except Exception as exc:
+        return f"graph initialization failed: {exc}"
+    return None
+
+
+def _companyintel_pre_report_gate(run_id: str, profile: Optional[str]) -> Optional[str]:
+    """Reject a successful report unless durable graph state exists."""
+    if profile != "companyintel":
+        return None
+    try:
+        from tools.companyintel_graph_tool import companyintel_graph
+        result = json.loads(companyintel_graph({"action": "summary", "run_id": run_id}))
+    except Exception as exc:
+        return f"companyintel pre-report gate unavailable: {exc}"
+    if not result.get("ok"):
+        return result.get("error", "companyintel graph summary failed")
+    if result.get("nodes", 0) < 1 or result.get("evidence", 0) < 1:
+        return (
+            "companyintel pre-report gate blocked completion: durable graph requires "
+            f"at least one node and evidence (nodes={result.get('nodes', 0)}, "
+            f"evidence={result.get('evidence', 0)})"
+        )
+    if result.get("frontier_open", 0) > 0 and not result.get("saturation_reason"):
+        return (
+            "companyintel pre-report gate blocked completion: frontier is not exhausted "
+            f"(frontier_open={result.get('frontier_open', 0)})"
+        )
+    return None
+
+
+def _companyintel_transition_graph(run_id: str, profile: Optional[str], status: str, reason: str = "") -> Optional[str]:
+    """Mirror API terminal lifecycle into the authoritative graph run service."""
+    if profile != "companyintel":
+        return None
+    try:
+        from tools.companyintel_graph_tool import companyintel_graph
+        result = json.loads(companyintel_graph({
+            "action": "transition_run",
+            "run_id": run_id,
+            "status": status,
+            "reason": reason,
+            "idempotency_key": f"api:{status.lower()}:{run_id}",
+        }))
+    except Exception as exc:
+        return f"companyintel graph transition failed: {exc}"
+    if not result.get("ok"):
+        return result.get("error", "companyintel graph transition failed")
+    return None
 
 
 try:
@@ -185,25 +312,13 @@ class ThreadSafeAsyncQueue(asyncio.Queue):
         self._loop_ref = asyncio.get_running_loop()
 
 
-def _sse_frame(data: Any, *, event: str = None, ensure_ascii: bool = True) -> bytes:
-    """Encode one SSE frame: optional ``event:`` line, then ``data: <json>\n\n``.
-
-    The single source of truth for SSE frame serialization across every
-    streaming writer in this module — ``_write_sse_chat_completion`` (the
-    five call sites it was first extracted from), ``_write_sse_responses``'s
-    inner ``_write_event`` closure, and the ``/v1/runs`` event stream.  All
-    three used the identical ``json.dumps(data)`` / ``json.dumps(...,
-    ensure_ascii=False)`` + ``"\\ndata: ...\\n\\n"`` shape; routing them all
-    through here keeps the on-the-wire format in exactly one place.
-
-    ``ensure_ascii`` defaults to ``True``, byte-identical to a bare
-    ``json.dumps(data)``.  Callers that must preserve raw non-ASCII bytes on
-    the wire (the Responses-API writer historically used
-    ``ensure_ascii=False``) pass ``ensure_ascii=False`` explicitly — the
-    option exists so every writer shares one helper without changing any
-    existing byte stream.
-    """
-    prefix = f"event: {event}\n" if event else ""
+def _sse_frame(data: Any, *, event: str = None, event_id: Any = None, ensure_ascii: bool = True) -> bytes:
+    """Encode one SSE frame with optional event name and replayable id."""
+    prefix = ""
+    if event_id is not None:
+        prefix += f"id: {event_id}\n"
+    if event:
+        prefix += f"event: {event}\n"
     return f"{prefix}data: {json.dumps(data, ensure_ascii=ensure_ascii)}\n\n".encode()
 
 
@@ -1437,9 +1552,6 @@ class APIServerAdapter(BasePlatformAdapter):
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
-        self._session_dbs: Dict[str, Any] = {}
-        self._session_db_cache_lock = threading.Lock()
-        self._session_db_cache_closed = False
         # Last-known-good resolved model per session (keyed by gateway_session_key
         # ONLY — never session_id, which rotates/is ephemeral for one-off API
         # server requests; "*" is the process-wide fallback), mirroring
@@ -1986,15 +2098,7 @@ class APIServerAdapter(BasePlatformAdapter):
         try:
             from hermes_cli.profiles import profiles_to_serve
 
-            served = {
-                name
-                for name, _ in profiles_to_serve(
-                    multiplex=True,
-                    profile_allowlist=getattr(
-                        cfg, "multiplex_profile_allowlist", None
-                    ),
-                )
-            }
+            served = {name for name, _ in profiles_to_serve(multiplex=True)}
         except Exception:
             return _PROFILE_REJECTED
         if profile not in served:
@@ -2093,9 +2197,10 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job),
             ("POST", "/v1/runs", self._handle_runs),
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
+            ("POST", "/v1/runs/{run_id}/resume", self._handle_resume_companyintel_run),
+            ("GET", "/v1/runs/{run_id}/{view:graph|frontier|evidence|report}", self._handle_companyintel_projection),
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
             ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
-            ("POST", "/v1/runs/{run_id}/steer", self._handle_steer_run),
             ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run),
         ]
         if _CRON_AVAILABLE:
@@ -2185,29 +2290,15 @@ class APIServerAdapter(BasePlatformAdapter):
         from hermes_state import SessionDB
 
         key = str(home)
-        with self._session_db_cache_lock:
-            if self._session_db_cache_closed:
-                return None
-            db = self._session_dbs.get(key)
-            if db is None:
-                db = SessionDB(db_path=home / "state.db")
-                self._session_dbs[key] = db
-            return db
-
-    def _close_cached_session_dbs(self) -> None:
-        """Close SessionDB handles owned by this adapter's profile cache."""
-        with self._session_db_cache_lock:
-            self._session_db_cache_closed = True
-            cached = list(self._session_dbs.values())
-            self._session_dbs.clear()
-        shared_db = getattr(self, "_session_db", None)
-        for db in cached:
-            if db is shared_db:
-                continue
-            try:
-                db.close()
-            except Exception:
-                logger.debug("Failed to close API-server SessionDB", exc_info=True)
+        cache = getattr(self, "_session_dbs", None)
+        if cache is None:
+            cache = {}
+            self._session_dbs = cache
+        db = cache.get(key)
+        if db is None:
+            db = SessionDB(db_path=home / "state.db")
+            cache[key] = db
+        return db
 
     def _ensure_session_db(self):
         """Lazily initialise and return the SessionDB for the active profile home.
@@ -2249,17 +2340,15 @@ class APIServerAdapter(BasePlatformAdapter):
 
             home = get_hermes_home()
             key = str(home)
-            with self._session_db_cache_lock:
-                cached = self._session_dbs.get(key)
-            if cached is not None:
-                return cached
+            cache = getattr(self, "_session_dbs", None)
+            if cache is not None and cache.get(key) is not None:
+                return cache[key]
             if self._session_db_lock is None:
                 self._session_db_lock = asyncio.Lock()
             async with self._session_db_lock:
-                with self._session_db_cache_lock:
-                    cached = self._session_dbs.get(key)
-                if cached is not None:
-                    return cached
+                cache = getattr(self, "_session_dbs", None)
+                if cache is not None and cache.get(key) is not None:
+                    return cache[key]
                 return await asyncio.to_thread(self._open_and_cache_session_db, home)
         except Exception as e:
             logger.debug("SessionDB unavailable for API server: %s", e)
@@ -3148,7 +3237,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_status": True,
                 "run_events_sse": True,
                 "run_stop": True,
-                "run_steer": True,
                 "run_approval_response": True,
                 "tool_progress_events": True,
                 "approval_events": True,
@@ -3179,7 +3267,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
-                "run_steer": {"method": "POST", "path": "/v1/runs/{run_id}/steer"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
@@ -3308,11 +3395,11 @@ class APIServerAdapter(BasePlatformAdapter):
             "output_tokens", "cache_read_tokens", "cache_write_tokens",
             "reasoning_tokens", "estimated_cost_usd", "actual_cost_usd",
             "api_call_count", "parent_session_id", "last_active", "preview",
-            "_lineage_root_id", "pinned", "archived", "hidden",
+            "_lineage_root_id", "pinned", "archived",
         )
         payload = {key: session.get(key) for key in safe_keys if key in session}
         # SQLite stores these as 0/1; clients reconcile against a real boolean.
-        for flag in ("pinned", "archived", "hidden"):
+        for flag in ("pinned", "archived"):
             if flag in payload:
                 payload[flag] = bool(payload[flag])
         # Avoid exposing full system prompts/model_config through the client API;
@@ -3534,19 +3621,16 @@ class APIServerAdapter(BasePlatformAdapter):
         # sidebar owns (the "keep" flag exempts a chat from the auto-archive
         # sweep). Rejecting them here was silently 400ing every pin the desktop
         # made, so pins only ever lived in that one app's localStorage.
-        # `unread` is the read-state watermark toggle (same desktop owner).
-        allowed = {"title", "end_reason", "pinned", "archived", "hidden", "unread"}
+        allowed = {"title", "end_reason", "pinned", "archived"}
         unknown = sorted(set(body) - allowed)
         if unknown:
             return web.json_response(_openai_error(f"Unsupported session fields: {', '.join(unknown)}", code="unsupported_session_field"), status=400)
 
-        for flag in ("pinned", "archived", "hidden", "unread"):
+        for flag in ("pinned", "archived"):
             if flag in body and not isinstance(body[flag], bool):
                 return web.json_response(_openai_error(f"'{flag}' must be a boolean", code="invalid_session_field"), status=400)
 
         db = await self._ensure_session_db_async()
-        if db is None:
-            return web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
         if "title" in body:
             try:
                 await asyncio.to_thread(db.set_session_title, session_id, "" if body["title"] is None else str(body["title"]))
@@ -3556,10 +3640,6 @@ class APIServerAdapter(BasePlatformAdapter):
             await asyncio.to_thread(db.set_session_pinned, session_id, body["pinned"])
         if "archived" in body:
             await asyncio.to_thread(db.set_session_archived, session_id, body["archived"])
-        if "hidden" in body:
-            await asyncio.to_thread(db.set_session_hidden, session_id, body["hidden"])
-        if "unread" in body:
-            await asyncio.to_thread(db.set_session_read, session_id, read=not body["unread"])
         if body.get("end_reason"):
             await asyncio.to_thread(db.end_session, session_id, str(body["end_reason"]))
         session = await asyncio.to_thread(db.get_session, session_id) or session
@@ -3874,12 +3954,6 @@ class APIServerAdapter(BasePlatformAdapter):
         queue: "asyncio.Queue[Optional[tuple[str, Dict[str, Any]]]]" = asyncio.Queue()
         message_id = f"msg_{uuid.uuid4().hex}"
         run_id = f"run_{uuid.uuid4().hex}"
-        self._set_run_status(
-            run_id,
-            "queued",
-            session_id=session_id,
-            model=body.get("model", self._model_name),
-        )
         seq = 0
 
         def _event_payload(name: str, payload: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
@@ -3922,7 +3996,6 @@ class APIServerAdapter(BasePlatformAdapter):
                     "user_message": {"role": "user", "content": user_message},
                     "runtime": runtime_meta,
                 }))
-                self._set_run_status(run_id, "running", last_event="run.started")
                 await queue.put(_event_payload("message.started", {"message": {"id": message_id, "role": "assistant"}}))
                 history = await self._conversation_history_for_session(session_id)
                 result, usage = await self._run_agent(
@@ -3932,7 +4005,6 @@ class APIServerAdapter(BasePlatformAdapter):
                     session_id=session_id,
                     stream_delta_callback=_delta,
                     tool_progress_callback=_tool_progress,
-                    active_run_id=run_id,
                     gateway_session_key=gateway_session_key,
                     route=route,
                     session_model=session_model,
@@ -3970,52 +4042,21 @@ class APIServerAdapter(BasePlatformAdapter):
                     "interrupted": False,
                     "runtime": effective_runtime,
                 }))
-                # A steer accepted after the final assistant response is drained
-                # into result["pending_steer"] by the turn finalizer instead of
-                # being consumed; surface it so clients can replay it as the
-                # next user turn rather than silently losing it.
-                pending_steer = result.get("pending_steer") if isinstance(result, dict) else None
-                completed_payload = {
+                await queue.put(_event_payload("run.completed", {
                     "session_id": effective_session_id,
                     "message_id": message_id,
                     "completed": True,
                     "messages": turn_messages,
                     "usage": usage,
                     "runtime": effective_runtime,
-                }
-                if pending_steer:
-                    completed_payload["pending_steer"] = pending_steer
-                await queue.put(_event_payload("run.completed", completed_payload))
-                self._set_run_status(
-                    run_id,
-                    "completed",
-                    session_id=effective_session_id,
-                    usage=usage,
-                    last_event="run.completed",
-                    **({"pending_steer": pending_steer} if pending_steer else {}),
-                )
-            except asyncio.CancelledError:
-                self._set_run_status(run_id, "cancelled", last_event="run.cancelled")
-                raise
+                }))
             except Exception as exc:
                 logger.exception("[api_server] session chat stream failed")
-                self._set_run_status(
-                    run_id,
-                    "failed",
-                    error=_redact_api_error_text(exc),
-                    last_event="run.failed",
-                )
                 await queue.put(_event_payload("error", {"message": _redact_api_error_text(exc)}))
             finally:
-                self._active_run_agents.pop(run_id, None)
                 await queue.put(_event_payload("done", {}))
                 await queue.put(None)
 
-        # NOTE: deliberately NOT registered in _active_run_tasks — this turn
-        # is already counted by active_agent_work_count() via
-        # _inflight_agent_runs (_run_agent), and a second task-based entry
-        # would double-count it in the shutdown drain. Run-scoped control
-        # needs only the agent ref, registered by _run_agent(active_run_id).
         task = asyncio.create_task(_run_and_signal())
         try:
             self._background_tasks.add(task)
@@ -4045,42 +4086,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     break
                 name, payload = item
                 await response.write(_sse_frame(payload, event=name, ensure_ascii=False))
-        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
-            await self._drain_session_stream_task_on_disconnect(
-                run_id, task, interrupt_message="SSE client disconnected", shield_wait=False
-            )
-            logger.info("Session SSE client disconnected; interrupted live run %s", run_id)
-        except asyncio.CancelledError:
-            await self._drain_session_stream_task_on_disconnect(
-                run_id, task, interrupt_message="SSE task cancelled", shield_wait=True
-            )
-            logger.info("Session SSE task cancelled; drained live run %s", run_id)
+        except (asyncio.CancelledError, ConnectionResetError):
+            task.cancel()
             raise
         except Exception as exc:
             logger.debug("[api_server] session SSE stream error: %s", exc)
         return response
-
-    async def _drain_session_stream_task_on_disconnect(
-        self,
-        run_id: str,
-        task: "asyncio.Task",
-        *,
-        interrupt_message: str,
-        shield_wait: bool,
-    ) -> None:
-        """Preserve live run control refs until the executor-backed turn actually exits."""
-        agent = self._active_run_agents.get(run_id)
-        if agent is None:
-            if not task.done():
-                task.cancel()
-                with suppress(Exception):
-                    await task
-            return
-        with suppress(Exception):
-            agent.interrupt(interrupt_message)
-        if not task.done():
-            with suppress(Exception):
-                await (asyncio.shield(task) if shield_wait else task)
 
     async def _handle_session_model_lock(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{session_id}/model — backend-ack a Browser model lock."""
@@ -5944,80 +5955,14 @@ class APIServerAdapter(BasePlatformAdapter):
             if not job_id:
                 return web.json_response({"error": "missing job_id"}, status=400)
 
-            from cron.scheduler_provider import (
-                provider_supports_split_fire,
-                resolve_cron_scheduler,
-            )
+            from cron.scheduler_provider import resolve_cron_scheduler
             provider = resolve_cron_scheduler()
 
             loop = asyncio.get_running_loop()
-            # Live adapters for delivery parity with the built-in ticker
-            # (gateway/run.py passes runner.adapters to the in-process
-            # scheduler). Without them, _deliver_result cannot resolve a live
-            # transport, so E2EE platforms and relay-fronted logical platforms
-            # (whose only send path IS the live relay adapter — no native
-            # credential exists) fail with "platform 'X' not
-            # configured/enabled" on every external-provider fire even though
-            # the same job delivers fine under the built-in ticker.
-            runner = self.gateway_runner or request.app.get("gateway_runner")
-            if runner is None:
-                try:
-                    from gateway.run import _gateway_runner_ref
-
-                    runner = _gateway_runner_ref()
-                except Exception:
-                    runner = None
-            adapters = getattr(runner, "adapters", None) or None
-
-            if not provider_supports_split_fire(provider):
-                # Legacy single-phase provider: it overrides the documented
-                # ``fire_due`` hook (custom claim/re-arm/telemetry) but
-                # inherits the base ``claim_fire`` — driving it through the
-                # split claim path would silently bypass that override.
-                task = asyncio.create_task(
-                    asyncio.to_thread(
-                        provider.fire_due,
-                        job_id,
-                        adapters=adapters,
-                        loop=loop,
-                    )
-                )
-                reservation["detached"] = True
-                task.add_done_callback(
-                    lambda _task: _release_pending_api_work(self, reservation)
-                )
-                try:
-                    self._background_tasks.add(task)
-                    task.add_done_callback(self._background_tasks.discard)
-                except (TypeError, AttributeError):
-                    pass
-                return web.json_response(
-                    {"status": "accepted", "job_id": job_id}, status=202
-                )
-
-            # Persist the attempt and exact store owner before acknowledging NAS.
-            # A failure here is retryable and the reservation remains attached.
-            try:
-                claimed_job = await asyncio.to_thread(provider.claim_fire, job_id)
-            except Exception as exc:
-                logger.error("cron fire admission failed for %s: %s", job_id, exc)
-                return web.json_response(
-                    {"error": "cron fire admission failed", "job_id": job_id},
-                    status=503,
-                )
-            if claimed_job is None:
-                return web.json_response(
-                    {"status": "duplicate", "job_id": job_id},
-                    status=200,
-                )
-
+            # Fire in the background (202 immediately). fire_due claims via the
+            # store CAS, so a retry while this is in flight is de-duped.
             task = asyncio.create_task(
-                asyncio.to_thread(
-                    provider.fire_claimed,
-                    claimed_job,
-                    adapters=adapters,
-                    loop=loop,
-                )
+                asyncio.to_thread(provider.fire_due, job_id, adapters=None, loop=loop)
             )
             reservation["detached"] = True
             task.add_done_callback(
@@ -6283,7 +6228,6 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_start_callback=None,
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
-        active_run_id: Optional[str] = None,
         gateway_session_key: Optional[str] = None,
         requested_model: Optional[str] = None,
         requested_provider: Optional[str] = None,
@@ -6318,10 +6262,6 @@ class APIServerAdapter(BasePlatformAdapter):
         at ``agent_ref[0]`` before ``run_conversation`` begins.  This allows
         callers (e.g. the SSE writer) to call ``agent.interrupt()`` from
         another thread to stop in-progress LLM calls.
-
-        If *active_run_id* is supplied, the same live agent is registered in
-        ``_active_run_agents`` while the turn is running so API clients can
-        call run-scoped control endpoints such as ``/v1/runs/{run_id}/steer``.
         """
         loop = asyncio.get_running_loop()
         # Capture before hopping to the executor — ContextVars do not follow
@@ -6357,8 +6297,6 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                     if agent_ref is not None:
                         agent_ref[0] = agent
-                    if active_run_id:
-                        self._active_run_agents[active_run_id] = agent
                     effective_task_id = session_id or str(uuid.uuid4())
                     # Baseline for selective background-process reaping on
                     # SSE client disconnect — mirrors gateway/run.py's
@@ -6500,8 +6438,6 @@ class APIServerAdapter(BasePlatformAdapter):
                     # point can't reap background work this turn left
                     # running on purpose. Mirrors the same race-window guard
                     # in gateway/run.py's _run_sync_with_timeout_lifecycle.
-                    if active_run_id:
-                        self._active_run_agents.pop(active_run_id, None)
                     if agent is not None:
                         _clear_turn_process_ownership(agent)
                         # Symmetric with the registration above: the turn is
@@ -6525,6 +6461,128 @@ class APIServerAdapter(BasePlatformAdapter):
     _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
     _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
 
+    def _durable_run_status_db(self):
+        from hermes_constants import get_hermes_home
+        path = get_hermes_home() / "run-status.db"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(path, timeout=10)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("CREATE TABLE IF NOT EXISTS run_status (run_id TEXT PRIMARY KEY, status_json TEXT NOT NULL, updated_at REAL NOT NULL)")
+        conn.execute("CREATE TABLE IF NOT EXISTS run_events (run_id TEXT NOT NULL, event_id INTEGER NOT NULL, event_json TEXT NOT NULL, created_at REAL NOT NULL, PRIMARY KEY(run_id, event_id))")
+        conn.execute("CREATE INDEX IF NOT EXISTS run_events_lookup_idx ON run_events(run_id, event_id)")
+        return conn
+
+    def _persist_run_status(self, status: Dict[str, Any]) -> None:
+        try:
+            conn = self._durable_run_status_db()
+            conn.execute(
+                "INSERT INTO run_status(run_id,status_json,updated_at) VALUES(?,?,?) "
+                "ON CONFLICT(run_id) DO UPDATE SET status_json=excluded.status_json, updated_at=excluded.updated_at",
+                (status["run_id"], json.dumps(status, ensure_ascii=False), status["updated_at"]),
+            )
+            conn.commit()
+            conn.close()
+        except Exception:
+            logger.exception("Failed to persist durable run status for %s", status.get("run_id"))
+
+    def _load_durable_run_status(self, run_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            conn = self._durable_run_status_db()
+            row = conn.execute("SELECT status_json FROM run_status WHERE run_id=?", (run_id,)).fetchone()
+            conn.close()
+            return json.loads(row[0]) if row else None
+        except Exception:
+            logger.exception("Failed to load durable run status for %s", run_id)
+            return None
+
+    def _is_companyintel_run(self, run_id: str) -> bool:
+        status = self._run_statuses.get(run_id) or self._load_durable_run_status(run_id) or {}
+        return status.get("profile") == "companyintel"
+
+    def _persist_run_event(self, run_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
+        """Append one event atomically to the run's authoritative event log."""
+        if self._is_companyintel_run(run_id):
+            try:
+                from tools.companyintel_graph_tool import companyintel_graph
+                payload = {key: value for key, value in event.items() if key not in {"event", "run_id", "id"}}
+                with self._profile_scope("companyintel"):
+                    result = json.loads(companyintel_graph({
+                        "action": "append_event",
+                        "run_id": run_id,
+                        "event_type": event.get("event", "run.event"),
+                        "payload": payload,
+                        "idempotency_key": event.get("idempotency_key", ""),
+                    }))
+                if not result.get("ok"):
+                    raise RuntimeError(result.get("error", "companyintel event append failed"))
+                stamped = dict(event)
+                stamped["id"] = str(result["event_id"])
+                return stamped
+            except Exception:
+                logger.exception("Failed to persist CompanyIntel run event for %s", run_id)
+                raise
+        conn = self._durable_run_status_db()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT COALESCE(MAX(event_id), 0) + 1 FROM run_events WHERE run_id=?", (run_id,)).fetchone()
+            event_id = int(row[0])
+            stamped = dict(event)
+            stamped["id"] = str(event_id)
+            conn.execute(
+                "INSERT INTO run_events(run_id,event_id,event_json,created_at) VALUES(?,?,?,?)",
+                (run_id, event_id, json.dumps(stamped, ensure_ascii=False), time.time()),
+            )
+            conn.commit()
+            return stamped
+        finally:
+            conn.close()
+
+    def _load_run_events(self, run_id: str, after_event_id: int = 0) -> List[Dict[str, Any]]:
+        if self._is_companyintel_run(run_id):
+            try:
+                from tools.companyintel_graph_tool import companyintel_graph
+                with self._profile_scope("companyintel"):
+                    result = json.loads(companyintel_graph({"action": "replay_events", "run_id": run_id, "after_event_id": max(0, int(after_event_id))}))
+                if not result.get("ok"):
+                    return []
+                events = []
+                for item in result.get("events", []):
+                    event = {"event": item["event"], "run_id": run_id, "id": str(item["event_id"]), "timestamp": item.get("created_at")}
+                    event.update(item.get("payload") or {})
+                    events.append(event)
+                return events
+            except Exception:
+                logger.exception("Failed to load CompanyIntel run events for %s", run_id)
+                return []
+        conn = self._durable_run_status_db()
+        try:
+            rows = conn.execute(
+                "SELECT event_json FROM run_events WHERE run_id=? AND event_id>? ORDER BY event_id ASC",
+                (run_id, max(0, int(after_event_id))),
+            ).fetchall()
+            return [json.loads(row[0]) for row in rows]
+        finally:
+            conn.close()
+
+    def _publish_run_event(self, run_id: str, event: Dict[str, Any], *, loop=None, queue=None) -> Optional[Dict[str, Any]]:
+        """Persist then deliver an event; delivery failure never loses the durable record."""
+        try:
+            stamped = self._persist_run_event(run_id, event)
+        except Exception:
+            logger.exception("Failed to persist run event for %s", run_id)
+            return None
+        target = queue if queue is not None else self._run_streams.get(run_id)
+        if target is None:
+            return stamped
+        try:
+            if loop is not None:
+                loop.call_soon_threadsafe(target.put_nowait, stamped)
+            else:
+                target.put_nowait(stamped)
+        except Exception:
+            logger.debug("Live SSE delivery failed for %s", run_id, exc_info=True)
+        return stamped
+
     def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
         """Update pollable run status without exposing private agent objects."""
         now = time.time()
@@ -6538,6 +6596,7 @@ class APIServerAdapter(BasePlatformAdapter):
         current.setdefault("created_at", fields.pop("created_at", now))
         current.update(fields)
         self._run_statuses[run_id] = current
+        self._persist_run_status(current)
         return current
 
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
@@ -6548,13 +6607,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._run_statuses.get(run_id, {}).get("status", "running"),
                 last_event=event.get("event"),
             )
-            q = self._run_streams.get(run_id)
-            if q is None:
-                return
-            try:
-                loop.call_soon_threadsafe(q.put_nowait, event)
-            except Exception:
-                pass
+            self._publish_run_event(run_id, event, loop=loop)
 
         def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
             ts = time.time()
@@ -6661,9 +6714,11 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error("No user message found in input"), status=400)
 
         instructions = body.get("instructions")
+        request_profile = _companyintel_effective_request_profile(body.get("profile"))
+        target_url = _companyintel_target_url_from_request(body, user_message)
+        if request_profile == "companyintel" and not target_url:
+            return web.json_response(_openai_error("CompanyIntel requires explicit 'target_url' (https://...)"), status=400)
         previous_response_id = body.get("previous_response_id")
-
-        # Accept explicit conversation_history from the request body.
         # Precedence: explicit conversation_history > previous_response_id.
         conversation_history: List[Dict[str, str]] = []
         raw_history = body.get("conversation_history")
@@ -6741,7 +6796,10 @@ class APIServerAdapter(BasePlatformAdapter):
         def _put_event_if_active(event: Optional[Dict]) -> None:
             """Enqueue only while this run still owns live transport state."""
             if self._run_streams.get(run_id) is q:
-                q.put_nowait(event)
+                if event is None:
+                    q.put_nowait(None)
+                else:
+                    self._publish_run_event(run_id, event, queue=q)
 
         # Also wire stream_delta_callback so message.delta events flow through.
         def _text_cb(delta: Optional[str]) -> None:
@@ -6764,12 +6822,13 @@ class APIServerAdapter(BasePlatformAdapter):
             "queued",
             created_at=created_at,
             session_id=session_id,
+            profile=request_profile,
             model=body.get("model", self._model_name),
         )
 
         # Background task outlives the HTTP response (and thus the middleware
-        # profile scope). Capture now and re-enter inside the task/executor.
-        request_profile = _api_request_profile.get()
+        # profile scope). ``request_profile`` was resolved before status
+        # persistence and is re-entered inside the task/executor below.
 
         async def _run_and_close():
             try:
@@ -6785,6 +6844,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "cancelled",
                         last_event="run.cancelled",
                     )
+                    _companyintel_transition_graph(run_id, request_profile, "CANCELLED", "run stopped before agent execution")
                     return
                 with self._profile_scope(request_profile):
                     agent = self._create_agent(
@@ -6861,6 +6921,92 @@ class APIServerAdapter(BasePlatformAdapter):
                                 session_id=session_id or "",
                             )
                             register_gateway_notify(approval_session_key, _approval_notify)
+                            if request_profile == "companyintel":
+                                graph_error = _companyintel_initialize_graph(run_id, user_message, target_url=target_url)
+                                if graph_error:
+                                    raise RuntimeError(graph_error)
+                                from tools.companyintel_graph_tool import companyintel_graph
+                                companyintel_batches = []
+                                for batch_index in range(10):
+                                    _put_event_if_active({
+                                        "event": "run.status",
+                                        "run_id": run_id,
+                                        "timestamp": time.time(),
+                                        "status": "running",
+                                        "phase": "frontier_batch",
+                                        "batch_index": batch_index,
+                                    })
+                                    self._set_run_status(
+                                        run_id,
+                                        "running",
+                                        last_event="run.status",
+                                        phase="frontier_batch",
+                                        batch_index=batch_index,
+                                    )
+                                    automatic_result = json.loads(companyintel_graph({
+                                        "action": "run_frontier",
+                                        "run_id": run_id,
+                                        "worker_id": f"api-companyintel-{run_id}-b{batch_index}",
+                                        "max_tasks": 50,
+                                        "lease_seconds": 300,
+                                        "reasoning_enabled": True,
+                                    }))
+                                    if not automatic_result.get("ok"):
+                                        raise RuntimeError(automatic_result.get("error", "companyintel automatic pivot execution failed"))
+                                    companyintel_batches.append(automatic_result)
+                                    frontier_summary = json.loads(companyintel_graph({"action": "summary", "run_id": run_id}))
+                                    if frontier_summary.get("status") == "RETRY_WAIT":
+                                        retry_at = float(frontier_summary.get("retry_at") or time.time())
+                                        _put_event_if_active({
+                                            "event": "run.retry_wait",
+                                            "run_id": run_id,
+                                            "timestamp": time.time(),
+                                            "status": "retry_wait",
+                                            "retry_at": retry_at,
+                                            "retry_reason": frontier_summary.get("retry_reason"),
+                                        })
+                                        self._set_run_status(
+                                            run_id,
+                                            "retry_wait",
+                                            last_event="run.retry_wait",
+                                            retry_at=retry_at,
+                                            retry_reason=frontier_summary.get("retry_reason"),
+                                        )
+                                        time.sleep(min(60.0, max(0.0, retry_at - time.time())))
+                                        resumed = json.loads(companyintel_graph({
+                                            "action": "resume_frontier",
+                                            "run_id": run_id,
+                                            "worker_id": f"api-companyintel-{run_id}-b{batch_index}",
+                                            "additional_tasks": 50,
+                                            "max_tasks": 50,
+                                            "lease_seconds": 300,
+                                            "reasoning_enabled": True,
+                                        }))
+                                        if not resumed.get("ok") and resumed.get("status") != "RETRY_WAIT":
+                                            raise RuntimeError(resumed.get("error", resumed.get("reason", "companyintel durable resume failed")))
+                                        frontier_summary = json.loads(companyintel_graph({"action": "summary", "run_id": run_id}))
+                                    if frontier_summary.get("frontier_open", 0) == 0 or (
+                                        frontier_summary.get("saturation_reason")
+                                        and frontier_summary.get("saturation_reason") != "BUDGET_EXHAUSTED:max_tasks"
+                                    ):
+                                        break
+                                frontier_summary = json.loads(companyintel_graph({"action": "summary", "run_id": run_id}))
+                                if frontier_summary.get("status") in {"RETRY_WAIT", "RESUMABLE", "PARTIAL"} and frontier_summary.get("frontier_open", 0) > 0:
+                                    return {"final_response": "CompanyIntel durable execution paused for bounded retry/resume.", "review_text": "", "deferred": True, "reason": frontier_summary.get("retry_reason") or frontier_summary.get("saturation_reason")}, {}
+                                report_result = json.loads(companyintel_graph({
+                                    "action": "generate_report",
+                                    "run_id": run_id,
+                                    "reasoning_enabled": True,
+                                    "terminal_transition_pending": True,
+                                }))
+                                if not report_result.get("ok"):
+                                    raise RuntimeError(report_result.get("reason", "companyintel report synthesis/review failed"))
+                                artifact = report_result.get("report", {})
+                                return {
+                                    "final_response": artifact.get("report_text", "CompanyIntel report completed."),
+                                    "review_text": artifact.get("review_text", ""),
+                                    "companyintel_report_ready": True,
+                                }, {}
                             # /v1/runs runs its own agent lifecycle (no
                             # TurnRunner, no _run_agent) — record turn process
                             # ownership so stop/cancel can reap only the
@@ -6898,7 +7044,33 @@ class APIServerAdapter(BasePlatformAdapter):
                         }
                         return r, u
 
-                result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
+                executor_future = asyncio.get_running_loop().run_in_executor(None, _run_sync)
+                try:
+                    timeout_raw = os.getenv("HERMES_AGENT_TIMEOUT", "1800")
+                    run_timeout = _companyintel_effective_gateway_timeout(request_profile, float(timeout_raw))
+                except (TypeError, ValueError):
+                    run_timeout = _companyintel_effective_gateway_timeout(request_profile, 1800.0)
+                try:
+                    if run_timeout:
+                        result, usage = await asyncio.wait_for(executor_future, timeout=run_timeout)
+                    else:
+                        result, usage = await executor_future
+                except asyncio.TimeoutError:
+                    logger.error("[api_server] run %s exceeded gateway timeout %.1fs", run_id, run_timeout)
+                    try:
+                        agent.interrupt()
+                    except Exception:
+                        pass
+                    error_msg = f"CompanyIntel run timed out after {int(run_timeout)} seconds"
+                    _put_event_if_active({
+                        "event": "run.failed",
+                        "run_id": run_id,
+                        "timestamp": time.time(),
+                        "error": error_msg,
+                    })
+                    self._set_run_status(run_id, "failed", error=error_msg, last_event="run.failed")
+                    _companyintel_transition_graph(run_id, request_profile, "FAILED", error_msg)
+                    return
                 if run_id in self._stopping_run_ids:
                     _put_event_if_active({
                         "event": "run.cancelled",
@@ -6910,6 +7082,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "cancelled",
                         last_event="run.cancelled",
                     )
+                    _companyintel_transition_graph(run_id, request_profile, "CANCELLED", "run stopped during agent execution")
                 # Check for structured failure (non-retryable client errors like
                 # 401/400 return failed=True instead of raising, so the except
                 # block below never fires — issue #15561).
@@ -6927,44 +7100,126 @@ class APIServerAdapter(BasePlatformAdapter):
                         error=error_msg,
                         last_event="run.failed",
                     )
+                    _companyintel_transition_graph(run_id, request_profile, "FAILED", error_msg)
                 else:
+                    if request_profile == "companyintel" and isinstance(result, dict) and result.get("deferred"):
+                        deferred_reason = _redact_api_error_text(result.get("reason") or "companyintel durable retry/resume pending")
+                        self._set_run_status(run_id, "retry_wait", error=deferred_reason, last_event="run.retry_wait")
+                        _put_event_if_active({"event": "run.retry_wait", "run_id": run_id, "timestamp": time.time(), "error": deferred_reason})
+                        _companyintel_transition_graph(run_id, request_profile, "RETRY_WAIT", deferred_reason)
+                        return
+                    gate_error = _companyintel_pre_report_gate(run_id, request_profile)
+                    if gate_error:
+                        error_msg = _redact_api_error_text(gate_error)
+                        _put_event_if_active({
+                            "event": "run.failed",
+                            "run_id": run_id,
+                            "timestamp": time.time(),
+                            "error": error_msg,
+                        })
+                        self._set_run_status(
+                            run_id,
+                            "failed",
+                            error=error_msg,
+                            last_event="run.failed",
+                        )
+                        _companyintel_transition_graph(run_id, request_profile, "FAILED", error_msg)
+                        return
                     final_response = result.get("final_response", "") if isinstance(result, dict) else ""
-                    # Undelivered steer text (accepted after the final response;
-                    # see turn_finalizer) rides on the terminal event/status so
-                    # the client can replay it as the next user turn.
-                    pending_steer = result.get("pending_steer") if isinstance(result, dict) else None
-                    completed_event = {
+                    quality_error = (
+                        _companyintel_incomplete_output_reason(final_response)
+                        if request_profile == "companyintel"
+                        else None
+                    )
+                    if quality_error:
+                        error_msg = _redact_api_error_text(quality_error)
+                        _put_event_if_active({
+                            "event": "run.failed",
+                            "run_id": run_id,
+                            "timestamp": time.time(),
+                            "error": error_msg,
+                        })
+                        self._set_run_status(
+                            run_id,
+                            "failed",
+                            error=error_msg,
+                            output=final_response,
+                            last_event="run.failed",
+                        )
+                        _companyintel_transition_graph(run_id, request_profile, "FAILED", error_msg)
+                        return
+                    if request_profile == "companyintel":
+                        from tools.companyintel_graph_tool import companyintel_graph
+                        report_result = json.loads(companyintel_graph({
+                            "action": "generate_report",
+                            "run_id": run_id,
+                            "report_text": final_response,
+                            "review_text": result.get("review_text", "") if isinstance(result, dict) else "",
+                            "model": agent_overrides.get("requested_model") or self._model_name,
+                            "provider": agent_overrides.get("requested_provider") or "",
+                            "reasoning_enabled": True,
+                            "terminal_transition_pending": True,
+                        }))
+                        if not report_result.get("ok"):
+                            error_msg = _redact_api_error_text(report_result.get("reason", "companyintel report persistence failed"))
+                            _put_event_if_active({"event": "run.failed", "run_id": run_id, "timestamp": time.time(), "error": error_msg})
+                            self._set_run_status(run_id, "failed", error=error_msg, last_event="run.failed")
+                            _companyintel_transition_graph(run_id, request_profile, "FAILED", error_msg)
+                            return
+                    graph_transition_error = _companyintel_transition_graph(run_id, request_profile, "COMPLETED", "agent report completed")
+                    if graph_transition_error:
+                        error_msg = _redact_api_error_text(graph_transition_error)
+                        _put_event_if_active({"event": "run.failed", "run_id": run_id, "timestamp": time.time(), "error": error_msg})
+                        self._set_run_status(run_id, "failed", error=error_msg, last_event="run.failed")
+                        return
+                    _put_event_if_active({
                         "event": "run.completed",
                         "run_id": run_id,
                         "timestamp": time.time(),
                         "output": final_response,
                         "usage": usage,
-                    }
-                    if pending_steer:
-                        completed_event["pending_steer"] = pending_steer
-                    _put_event_if_active(completed_event)
+                    })
                     self._set_run_status(
                         run_id,
                         "completed",
                         output=final_response,
                         usage=usage,
                         last_event="run.completed",
-                        **({"pending_steer": pending_steer} if pending_steer else {}),
                     )
             except asyncio.CancelledError:
-                self._set_run_status(
-                    run_id,
-                    "cancelled",
-                    last_event="run.cancelled",
-                )
-                try:
-                    _put_event_if_active({
-                        "event": "run.cancelled",
-                        "run_id": run_id,
-                        "timestamp": time.time(),
-                    })
-                except Exception:
-                    pass
+                interrupted_by_stop = run_id in self._stopping_run_ids
+                if request_profile == "companyintel" and not interrupted_by_stop:
+                    reason = "gateway/process interrupted; checkpoint is resumable"
+                    self._set_run_status(
+                        run_id,
+                        "resumable",
+                        error=reason,
+                        last_event="run.resumable",
+                    )
+                    _companyintel_transition_graph(run_id, request_profile, "RESUMABLE", reason)
+                    try:
+                        _put_event_if_active({
+                            "event": "run.resumable",
+                            "run_id": run_id,
+                            "timestamp": time.time(),
+                            "reason": reason,
+                        })
+                    except Exception:
+                        pass
+                else:
+                    self._set_run_status(
+                        run_id,
+                        "cancelled",
+                        last_event="run.cancelled",
+                    )
+                    try:
+                        _put_event_if_active({
+                            "event": "run.cancelled",
+                            "run_id": run_id,
+                            "timestamp": time.time(),
+                        })
+                    except Exception:
+                        pass
                 raise
             except _ProviderAuthResolutionError as exc:
                 # /v1/runs builds its own agent via _create_agent() and does
@@ -6982,6 +7237,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     error=error_msg,
                     last_event="run.failed",
                 )
+                _companyintel_transition_graph(run_id, request_profile, "FAILED", error_msg)
                 try:
                     _put_event_if_active({
                         "event": "run.failed",
@@ -6999,6 +7255,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     error=_redact_api_error_text(exc),
                     last_event="run.failed",
                 )
+                _companyintel_transition_graph(run_id, request_profile, "FAILED", _redact_api_error_text(exc))
                 try:
                     _put_event_if_active({
                         "event": "run.failed",
@@ -7049,6 +7306,49 @@ class APIServerAdapter(BasePlatformAdapter):
             headers=response_headers,
         )
 
+    async def _handle_companyintel_projection(self, request: "web.Request") -> "web.Response":
+        """GET CompanyIntel graph/frontier/evidence/report durable projections."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        run_id = request.match_info["run_id"]
+        view = request.match_info["view"]
+        try:
+            from tools.companyintel_graph_tool import companyintel_graph
+            with self._profile_scope("companyintel"):
+                result = json.loads(companyintel_graph({"action": "projection", "run_id": run_id, "view": view}))
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc), code="companyintel_projection_error"), status=404)
+        if not result.get("ok"):
+            return web.json_response(_openai_error(result.get("error", "projection unavailable"), code="companyintel_projection_unavailable"), status=404)
+        if view == "report" and not result["data"].get("ready"):
+            return web.json_response({"ok": False, "run_id": run_id, "error": {"message": result["data"].get("reason", "report_not_ready"), "code": "report_not_ready"}, "data": result["data"]}, status=409)
+        return web.json_response(result)
+
+    async def _handle_resume_companyintel_run(self, request: "web.Request") -> "web.Response":
+        """POST /v1/runs/{run_id}/resume — resume durable CompanyIntel frontier."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        run_id = request.match_info["run_id"]
+        try:
+            body = await request.json() if request.can_read_body else {}
+            if not isinstance(body, dict):
+                body = {}
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        try:
+            from tools.companyintel_graph_tool import companyintel_graph
+            args = {"action": "resume_frontier", "run_id": run_id, "worker_id": f"api-resume-{run_id}", "additional_tasks": body.get("additional_tasks", 25), "additional_searches": body.get("additional_searches", body.get("additional_tasks", 25)), "deadline_seconds": body.get("deadline_seconds", 3600)}
+            with self._profile_scope("companyintel"):
+                result = json.loads(companyintel_graph(args))
+        except Exception as exc:
+            return web.json_response(_openai_error(str(exc), code="companyintel_resume_error"), status=404)
+        if not result.get("ok") or not result.get("resumed"):
+            status = 409 if result.get("reason") in {"retry_not_ready", "run_not_resumable"} else 404
+            return web.json_response({"ok": False, "run_id": run_id, "error": {"message": result.get("reason", result.get("error", "resume failed")), "code": "run_not_resumable"}, "status": result.get("status")}, status=status)
+        return web.json_response({"ok": True, "run_id": run_id, "status": result.get("status", "RUNNING"), "resumed": True, "frontier": result}, status=202)
+
     async def _handle_get_run(self, request: "web.Request") -> "web.Response":
         """GET /v1/runs/{run_id} — return pollable run status for external UIs."""
         auth_err = self._check_auth(request)
@@ -7058,31 +7358,57 @@ class APIServerAdapter(BasePlatformAdapter):
         run_id = request.match_info["run_id"]
         status = self._run_statuses.get(run_id)
         if status is None:
+            status = self._load_durable_run_status(run_id)
+        if status is None:
             return web.json_response(
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"),
                 status=404,
             )
+        if (
+            str(status.get("status") or "").lower() == "completed"
+            and (
+                status.get("profile") == "companyintel"
+                or status.get("model") == "companyintel"
+            )
+        ):
+            quality_error = _companyintel_incomplete_output_reason(status.get("output"))
+            if quality_error:
+                self._set_run_status(
+                    run_id,
+                    "failed",
+                    error=quality_error,
+                    output=status.get("output", ""),
+                    last_event="run.failed",
+                )
+                status = self._run_statuses[run_id]
         return web.json_response(status)
 
     async def _handle_run_events(self, request: "web.Request") -> "web.StreamResponse":
-        """GET /v1/runs/{run_id}/events — SSE stream of structured agent lifecycle events."""
+        """GET /v1/runs/{run_id}/events — replayable SSE lifecycle stream."""
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
 
         run_id = request.match_info["run_id"]
+        raw_last_id = request.headers.get("Last-Event-ID", request.query.get("last_event_id", "0"))
+        try:
+            last_event_id = max(0, int(raw_last_id or 0))
+        except (TypeError, ValueError):
+            return web.json_response(_openai_error("Last-Event-ID must be an integer", code="invalid_last_event_id"), status=400)
 
-        # Allow subscribing slightly before the run is registered (race condition window)
+        # Allow subscribing slightly before the run is registered, while also
+        # allowing a completed run to be replayed after its live queue vanished.
+        q = None
         for _ in range(20):
-            if run_id in self._run_streams:
+            q = self._run_streams.get(run_id)
+            if q is not None or self._load_durable_run_status(run_id) is not None:
                 break
             await asyncio.sleep(0.05)
         else:
             return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
 
-        q = self._run_streams[run_id]
+        replay = self._load_run_events(run_id, last_event_id)
         self._run_stream_subscribers.add(run_id)
-
         response = web.StreamResponse(
             status=200,
             headers={
@@ -7092,8 +7418,38 @@ class APIServerAdapter(BasePlatformAdapter):
             },
         )
         await response.prepare(request)
-
+        last_sent = last_event_id
         try:
+            for event in replay:
+                event_id = int(event.get("id", 0))
+                await response.write(_sse_frame(event, event=event.get("event"), event_id=event_id))
+                last_sent = max(last_sent, event_id)
+
+            if q is None:
+                await response.write(b": replay complete\n\n")
+                return response
+
+            # Events were queued while the replay snapshot was read. Discard
+            # only queue entries already covered by replay; retain newer ones.
+            pending = []
+            while True:
+                try:
+                    queued = q.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if queued is None:
+                    pending.append(None)
+                    break
+                if int(queued.get("id", 0)) > last_sent:
+                    pending.append(queued)
+            for queued in pending:
+                if queued is None:
+                    await response.write(b": stream closed\n\n")
+                    return response
+                event_id = int(queued.get("id", 0))
+                await response.write(_sse_frame(queued, event=queued.get("event"), event_id=event_id))
+                last_sent = max(last_sent, event_id)
+
             while True:
                 try:
                     event = await asyncio.wait_for(q.get(), timeout=30.0)
@@ -7101,17 +7457,20 @@ class APIServerAdapter(BasePlatformAdapter):
                     await response.write(b": keepalive\n\n")
                     continue
                 if event is None:
-                    # Run finished — send final SSE comment and close
                     await response.write(b": stream closed\n\n")
                     break
-                payload = _sse_frame(event)
-                await response.write(payload)
+                event_id = int(event.get("id", 0))
+                if event_id <= last_sent:
+                    continue
+                await response.write(_sse_frame(event, event=event.get("event"), event_id=event_id))
+                last_sent = event_id
         except Exception as exc:
             logger.debug("[api_server] SSE stream error for run %s: %s", run_id, exc)
         finally:
             self._run_stream_subscribers.discard(run_id)
-            self._run_streams.pop(run_id, None)
-            self._run_streams_created.pop(run_id, None)
+            if q is not None and self._run_streams.get(run_id) is q:
+                self._run_streams.pop(run_id, None)
+                self._run_streams_created.pop(run_id, None)
 
         return response
 
@@ -7204,66 +7563,6 @@ class APIServerAdapter(BasePlatformAdapter):
             "resolved": resolved,
         })
 
-    async def _handle_steer_run(self, request: "web.Request") -> "web.Response":
-        """POST /v1/runs/{run_id}/steer — inject guidance into a running agent."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-
-        run_id = request.match_info["run_id"]
-        status = self._run_statuses.get(run_id)
-        if status is None:
-            return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
-        # Only genuinely running runs are steerable.  /stop retains agent/task
-        # refs during cooperative shutdown, so the status gate (not the mere
-        # presence of an agent ref) is what rejects stop-then-steer.
-        agent = self._active_run_agents.get(run_id)
-        if status.get("status") != "running" or not hasattr(agent, "steer"):
-            return web.json_response(
-                _openai_error(
-                    f"Run is not currently accepting steer input: {run_id}",
-                    code="run_not_accepting_steer",
-                ),
-                status=409,
-            )
-
-        body, err = await self._read_json_body(request)
-        if err:
-            return err
-        raw_text = body.get("input") or body.get("message") or body.get("text") or ""
-        steer_text = _normalize_chat_content(raw_text).strip()
-        if not steer_text:
-            return web.json_response(
-                _openai_error(
-                    "Missing non-empty steer text; expected 'input', 'message', or 'text'.",
-                    code="invalid_steer_input",
-                ),
-                status=400,
-            )
-
-        try:
-            accepted = bool(agent.steer(steer_text))
-        except Exception as exc:
-            logger.exception("[api_server] steer failed for run %s", run_id)
-            return web.json_response(_openai_error(_redact_api_error_text(exc), code="steer_failed"), status=500)
-        if not accepted:
-            return web.json_response(
-                _openai_error(f"Run did not accept steer text: {run_id}", code="steer_not_accepted"),
-                status=409,
-            )
-
-        self._set_run_status(run_id, "running", last_event="run.steered")
-        q = self._run_streams.get(run_id)
-        if q is not None:
-            with suppress(Exception):
-                q.put_nowait({
-                    "event": "run.steered",
-                    "run_id": run_id,
-                    "timestamp": time.time(),
-                    "accepted": True,
-                })
-        return web.json_response({"object": "hermes.run.steer", "run_id": run_id, "accepted": True})
-
     async def _handle_stop_run(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
         auth_err = self._check_auth(request)
@@ -7275,7 +7574,35 @@ class APIServerAdapter(BasePlatformAdapter):
         task = self._active_run_tasks.get(run_id)
 
         if agent is None and task is None:
-            return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
+            known = self._run_statuses.get(run_id) or self._load_durable_run_status(run_id)
+            if not known:
+                return web.json_response(
+                    _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                    status=404,
+                )
+            current_status = str(known.get("status") or "").lower()
+            if current_status in {"completed", "failed", "cancelled"}:
+                return web.json_response({"run_id": run_id, "status": current_status})
+
+            profile = known.get("profile")
+            transition_error = _companyintel_transition_graph(
+                run_id,
+                profile,
+                "CANCELLED",
+                "stop requested for durable inactive run",
+            )
+            if transition_error:
+                return web.json_response(
+                    _openai_error(transition_error, code="companyintel_stop_failed"),
+                    status=409,
+                )
+            self._set_run_status(
+                run_id,
+                "cancelled",
+                last_event="run.cancelled",
+                error="stop requested for durable inactive run",
+            )
+            return web.json_response({"run_id": run_id, "status": "cancelled"})
 
         self._set_run_status(run_id, "stopping", last_event="run.stopping")
         self._stopping_run_ids.add(run_id)
@@ -7294,6 +7621,24 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent, source="api_server_run_stop"
             )
 
+        async def _force_terminal_cancel() -> None:
+            # A provider/tool executor may ignore the cooperative interrupt.
+            # Do not leave the durable API lifecycle in STOPPING forever.
+            await asyncio.sleep(30.0)
+            current = self._active_run_tasks.get(run_id)
+            if current is None or current.done() or run_id not in self._stopping_run_ids:
+                return
+            self._stopping_run_ids.discard(run_id)
+            current.cancel()
+            self._set_run_status(run_id, "cancelled", last_event="run.cancelled", error="stop grace period expired")
+            profile = self._run_statuses.get(run_id, {}).get("profile")
+            _companyintel_transition_graph(run_id, profile, "CANCELLED", "stop grace period expired")
+            self._run_streams.pop(run_id, None)
+            self._run_streams_created.pop(run_id, None)
+            self._active_run_tasks.pop(run_id, None)
+            self._active_run_agents.pop(run_id, None)
+
+        asyncio.create_task(_force_terminal_cancel())
         return web.json_response({"run_id": run_id, "status": "stopping"})
 
     async def _sweep_orphaned_runs(self) -> None:
@@ -7393,9 +7738,6 @@ class APIServerAdapter(BasePlatformAdapter):
         if not AIOHTTP_AVAILABLE:
             logger.warning("[%s] aiohttp not installed", self.name)
             return False
-
-        with self._session_db_cache_lock:
-            self._session_db_cache_closed = False
 
         if not self._api_key_passes_startup_guard():
             # A rejected API_SERVER_KEY is a configuration error, not a
@@ -7567,16 +7909,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 logger.debug(
                     "Failed to close response store for %s", self.name, exc_info=True,
                 )
-        try:
-            if self._site:
-                await self._site.stop()
-                self._site = None
-            if self._runner:
-                await self._runner.cleanup()
-                self._runner = None
-        finally:
-            self._close_cached_session_dbs()
-            self._app = None
+        if self._site:
+            await self._site.stop()
+            self._site = None
+        if self._runner:
+            await self._runner.cleanup()
+            self._runner = None
+        self._app = None
         logger.info("[%s] API server stopped", self.name)
 
     async def send(

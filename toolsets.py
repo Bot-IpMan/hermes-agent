@@ -23,7 +23,7 @@ Usage:
     all_tools = resolve_toolset("full_stack")
 """
 
-from typing import Dict, List, Any, Set, Optional, Tuple
+from typing import List, Dict, Any, Set, Optional
 
 
 # Shared tool list for CLI and all messaging platform toolsets.
@@ -55,8 +55,6 @@ _HERMES_CORE_TOOLS = [
     "browser_type", "browser_scroll", "browser_back",
     "browser_press", "browser_get_images",
     "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
-    # replaces other tools when browser.backend is "browser-use"
-    "browser_exec",
     # Text-to-speech
     "text_to_speech",
     # Planning & memory
@@ -81,12 +79,16 @@ _HERMES_CORE_TOOLS = [
     # profile explicitly enables the kanban toolset. Gated via check_fn in
     # tools/kanban_tools.py.
     "kanban_show", "kanban_list",
-    "kanban_complete", "kanban_block", "kanban_request_review",
-    "kanban_request_changes",
-    "kanban_heartbeat",
+    "kanban_complete", "kanban_block", "kanban_heartbeat",
     "kanban_comment", "kanban_create", "kanban_link",
     "kanban_unblock",
     "kanban_attach", "kanban_attach_url", "kanban_attachments",
+    # Profile-gated deterministic Corporate Intelligence graph runtime
+    "companyintel_graph",
+    "companyintel_init_run", "companyintel_record_observation",
+    "companyintel_enqueue_pivots", "companyintel_claim_frontier",
+    "companyintel_complete_frontier", "companyintel_checkpoint",
+    "companyintel_graph_summary", "companyintel_candidate_ledger", "companyintel_validate",
     # Computer use (macOS, gated on cua-driver being installed via check_fn)
     "computer_use",
 ]
@@ -209,7 +211,7 @@ TOOLSETS = {
             "browser_type", "browser_scroll", "browser_back",
             "browser_press", "browser_get_images",
             "browser_vision", "browser_console", "browser_cdp",
-            "browser_dialog", "browser_exec", "web_search"
+            "browser_dialog", "web_search"
         ],
         "includes": []
     },
@@ -257,6 +259,22 @@ TOOLSETS = {
         "includes": []
     },
 
+    # Built-in, profile-gated deterministic Corporate Intelligence runtime.
+    # Keep this as a real static toolset (not registry-only) so platform
+    # composite reverse-mapping preserves it in effective model schemas.
+    "companyintel": {
+        "description": "Durable CompanyIntel graph, evidence, frontier and report runtime",
+        "tools": [
+            "companyintel_graph",
+            "companyintel_init_run", "companyintel_record_observation",
+            "companyintel_enqueue_pivots", "companyintel_claim_frontier",
+            "companyintel_complete_frontier", "companyintel_checkpoint",
+            "companyintel_graph_summary", "companyintel_candidate_ledger",
+            "companyintel_validate",
+        ],
+        "includes": []
+    },
+
     "project": {
         "description": "Desktop Projects — create/switch named workspaces (GUI sessions only)",
         "tools": ["project_list", "project_create", "project_switch"],
@@ -279,7 +297,6 @@ TOOLSETS = {
             "open_preview", "read_preview",
             "read_window_below",
             "focus_pane", "react_to_message",
-            "setup_mcp",
         ],
         "includes": []
     },
@@ -317,14 +334,12 @@ TOOLSETS = {
             "is spawned by the kanban dispatcher (HERMES_KANBAN_TASK env "
             "set). The dispatcher runs inside the gateway by default; see "
             "`kanban.dispatch_in_gateway` in config.yaml. Lets workers mark "
-            "tasks done with structured handoffs, enter first-class review "
-            "(request_review — not a block), return review changes, block for human input, "
+            "tasks done with structured handoffs, block for human input, "
             "heartbeat during long ops, comment on threads, attach files, and "
             "(for orchestrators) list, unblock, and fan out tasks."
         ),
         "tools": [
             "kanban_show", "kanban_list", "kanban_complete", "kanban_block",
-            "kanban_request_review", "kanban_request_changes",
             "kanban_heartbeat", "kanban_comment",
             "kanban_create", "kanban_link",
             "kanban_unblock",
@@ -417,7 +432,6 @@ TOOLSETS = {
             "browser_type", "browser_scroll", "browser_back",
             "browser_press", "browser_get_images",
             "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
-            "browser_exec",
             "todo", "memory",
             "session_search", "clarify",
             "execute_code", "delegate_task",
@@ -450,7 +464,6 @@ TOOLSETS = {
             "browser_type", "browser_scroll", "browser_back",
             "browser_press", "browser_get_images",
             "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
-            "browser_exec",
             "todo", "memory",
             "session_search",
             "execute_code", "delegate_task",
@@ -480,7 +493,6 @@ TOOLSETS = {
             "browser_type", "browser_scroll", "browser_back",
             "browser_press", "browser_get_images",
             "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
-            "browser_exec",
             # Planning & memory
             "todo", "memory",
             # Session history search
@@ -491,6 +503,13 @@ TOOLSETS = {
             "cronjob",
             # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
             "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
+            # Profile-gated deterministic Corporate Intelligence graph runtime
+            "companyintel_graph",
+            "companyintel_init_run", "companyintel_record_observation",
+            "companyintel_enqueue_pivots", "companyintel_claim_frontier",
+            "companyintel_complete_frontier", "companyintel_checkpoint",
+            "companyintel_graph_summary", "companyintel_candidate_ledger",
+            "companyintel_validate",
 
         ],
         "includes": []
@@ -753,19 +772,6 @@ def bundle_non_core_tools(toolset_name: str) -> Set[str]:
     return to_remove
 
 
-# Resolution memo keyed on (toolset name, include_registry, registry
-# generation). resolve_toolset() recursively walks toolset includes and, with
-# include_registry=True, merges registry-registered tools on every call —
-# measured ~2us/toolset in isolation but called dozens of times per
-# _get_platform_tools() (per-keystroke /tools completion) and per picker
-# render. The registry exposes a monotonic _generation counter (bumped on
-# every register/deregister/alias/MCP refresh — see tools/registry.py), so a
-# cache entry is valid for as long as the generation is unchanged; external
-# callers never pass ``visited``, so the memo engages exactly at the public
-# entry and the internal cycle-detection recursion stays untouched.
-_resolve_toolset_memo: Dict[Tuple[str, bool, int, int], List[str]] = {}
-
-
 def resolve_toolset(name: str, visited: Set[str] = None, *, include_registry: bool = True) -> List[str]:
     """
     Recursively resolve a toolset to get all tool names.
@@ -786,21 +792,6 @@ def resolve_toolset(name: str, visited: Set[str] = None, *, include_registry: bo
     Returns:
         List[str]: List of all tool names in the toolset
     """
-    external_call = visited is None
-    if external_call:
-        try:
-            from tools.registry import registry
-
-            registry_id = id(registry)
-            generation = getattr(registry, "_generation", 0)
-        except Exception:
-            registry_id = 0
-            generation = 0
-        memo_key = (name, include_registry, registry_id, generation)
-        cached = _resolve_toolset_memo.get(memo_key)
-        if cached is not None:
-            return list(cached)
-
     if visited is None:
         visited = set()
 
@@ -839,7 +830,7 @@ def resolve_toolset(name: str, visited: Set[str] = None, *, include_registry: bo
                     try:
                         from tools.registry import registry
                         plugin_tools.update(
-                            e.name for e in registry.get_all_entries()
+                            e.name for e in registry._tools.values()
                             if e.toolset == platform_name
                         )
                     except Exception:
@@ -860,22 +851,7 @@ def resolve_toolset(name: str, visited: Set[str] = None, *, include_registry: bo
         included_tools = resolve_toolset(included_name, visited, include_registry=include_registry)
         tools.update(included_tools)
 
-    result = sorted(tools)
-    if external_call:
-        try:
-            from tools.registry import registry
-
-            registry_id = id(registry)
-            generation = getattr(registry, "_generation", 0)
-        except Exception:
-            registry_id = 0
-            generation = 0
-        # Entries from previous registry generations are never hit again;
-        # keep the memo bounded across long sessions with many MCP refreshes.
-        if len(_resolve_toolset_memo) >= 256:
-            _resolve_toolset_memo.clear()
-        _resolve_toolset_memo[(name, include_registry, registry_id, generation)] = list(result)
-    return result
+    return sorted(tools)
 
 
 def resolve_multiple_toolsets(toolset_names: List[str]) -> List[str]:
