@@ -44,7 +44,7 @@ Implemented in the graph tool and API server:
 - SQLite run state, checkpoints and events;
 - replayable SSE endpoint;
 - idempotent stop/terminal transitions;
-- same-model retry/resume policy;
+- automatic retry policy: bounded inline retry, durable retry metadata, and explicit manual-resume boundary (`docs/companyintel-automatic-retry-policy.md`);
 - terminal state persisted before cleanup;
 - Hub state is a projection, not the run owner.
 
