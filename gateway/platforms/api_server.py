@@ -7212,6 +7212,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "completed",
                         output=final_response,
                         usage=usage,
+                        pending_steer=result.get("pending_steer") if isinstance(result, dict) else None,
                         last_event="run.completed",
                     )
             except asyncio.CancelledError:
@@ -7639,6 +7640,69 @@ class APIServerAdapter(BasePlatformAdapter):
             "run_id": run_id,
             "choice": choice,
             "resolved": resolved,
+        })
+
+    async def _handle_steer_run(self, request: "web.Request") -> "web.Response":
+        """POST /v1/runs/{run_id}/steer — inject guidance into a running agent."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        run_id = request.match_info["run_id"]
+        try:
+            body = await request.json() if request.can_read_body else {}
+        except Exception:
+            body = {}
+        steer_input = body.get("input") if isinstance(body, dict) else None
+        if not isinstance(steer_input, str) or not steer_input.strip():
+            return web.json_response(
+                _openai_error("Steer input is required", code="invalid_steer_input"),
+                status=400,
+            )
+
+        status = self._run_statuses.get(run_id) or self._load_durable_run_status(run_id)
+        agent = self._active_run_agents.get(run_id)
+        if not status and agent is None:
+            return web.json_response(
+                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                status=404,
+            )
+        current_status = str((status or {}).get("status") or "").lower()
+        if run_id in self._stopping_run_ids or current_status not in {"", "running", "starting"}:
+            return web.json_response(
+                _openai_error(
+                    f"Run is not accepting steer input: {run_id}",
+                    code="run_not_accepting_steer",
+                ),
+                status=409,
+            )
+        if agent is None or not callable(getattr(agent, "steer", None)):
+            return web.json_response(
+                _openai_error(f"Run has no active agent: {run_id}", code="run_not_accepting_steer"),
+                status=409,
+            )
+
+        try:
+            accepted = bool(agent.steer(steer_input.strip()))
+        except Exception as exc:
+            logger.exception("[api_server] steer failed for run %s", run_id)
+            return web.json_response(_openai_error(str(exc), code="steer_failed"), status=500)
+        self._set_run_status(run_id, "running", last_event="run.steered")
+        event = {
+            "event": "run.steered",
+            "run_id": run_id,
+            "timestamp": time.time(),
+            "accepted": accepted,
+        }
+        queue = self._run_streams.get(run_id)
+        if queue is not None:
+            try:
+                queue.put_nowait(event)
+            except Exception:
+                logger.debug("[api_server] unable to publish steer event for %s", run_id, exc_info=True)
+        return web.json_response({
+            "object": "hermes.run.steer",
+            "run_id": run_id,
+            "accepted": accepted,
         })
 
     async def _handle_stop_run(self, request: "web.Request") -> "web.Response":
