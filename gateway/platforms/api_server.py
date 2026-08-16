@@ -1465,6 +1465,9 @@ class _ProviderAuthResolutionError(RuntimeError):
     """
 
 
+_RUN_STATUS_DB_INIT_LOCK = threading.Lock()
+
+
 class APIServerAdapter(BasePlatformAdapter):
     """
     OpenAI-compatible HTTP API server adapter.
@@ -6466,12 +6469,20 @@ class APIServerAdapter(BasePlatformAdapter):
         from hermes_constants import get_hermes_home
         path = get_hermes_home() / "run-status.db"
         path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(path, timeout=10)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("CREATE TABLE IF NOT EXISTS run_status (run_id TEXT PRIMARY KEY, status_json TEXT NOT NULL, updated_at REAL NOT NULL)")
-        conn.execute("CREATE TABLE IF NOT EXISTS run_events (run_id TEXT NOT NULL, event_id INTEGER NOT NULL, event_json TEXT NOT NULL, created_at REAL NOT NULL, PRIMARY KEY(run_id, event_id))")
-        conn.execute("CREATE INDEX IF NOT EXISTS run_events_lookup_idx ON run_events(run_id, event_id)")
-        return conn
+        with _RUN_STATUS_DB_INIT_LOCK:
+            preexisting_db = path.exists()
+            conn = sqlite3.connect(path, timeout=60)
+            conn.execute("PRAGMA busy_timeout=60000")
+            # Re-applying journal_mode on every status/event connection takes a
+            # writer lock and races with status persistence. Bootstrap it only
+            # for a new database; existing databases are already WAL-enabled.
+            if not preexisting_db:
+                conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("CREATE TABLE IF NOT EXISTS run_status (run_id TEXT PRIMARY KEY, status_json TEXT NOT NULL, updated_at REAL NOT NULL)")
+            conn.execute("CREATE TABLE IF NOT EXISTS run_events (run_id TEXT NOT NULL, event_id INTEGER NOT NULL, event_json TEXT NOT NULL, created_at REAL NOT NULL, PRIMARY KEY(run_id, event_id))")
+            conn.execute("CREATE INDEX IF NOT EXISTS run_events_lookup_idx ON run_events(run_id, event_id)")
+            conn.commit()
+            return conn
 
     def _persist_run_status(self, status: Dict[str, Any]) -> None:
         try:
@@ -7335,9 +7346,15 @@ class APIServerAdapter(BasePlatformAdapter):
             with self._profile_scope("companyintel"):
                 result = json.loads(companyintel_graph({"action": "projection", "run_id": run_id, "view": view}))
         except Exception as exc:
-            return web.json_response(_openai_error(str(exc), code="companyintel_projection_error"), status=404)
+            message = str(exc)
+            code = "companyintel_projection_initializing" if "not initialized" in message.lower() else "companyintel_projection_error"
+            status = 409 if code == "companyintel_projection_initializing" else 500
+            return web.json_response(_openai_error(message, code=code), status=status)
         if not result.get("ok"):
-            return web.json_response(_openai_error(result.get("error", "projection unavailable"), code="companyintel_projection_unavailable"), status=404)
+            message = result.get("error", "projection unavailable")
+            if "not initialized" in str(message).lower():
+                return web.json_response(_openai_error(message, code="companyintel_projection_initializing"), status=409)
+            return web.json_response(_openai_error(message, code="companyintel_projection_unavailable"), status=404)
         if view == "report" and not result["data"].get("ready"):
             return web.json_response({"ok": False, "run_id": run_id, "error": {"message": result["data"].get("reason", "report_not_ready"), "code": "report_not_ready"}, "data": result["data"]}, status=409)
         return web.json_response(result)
