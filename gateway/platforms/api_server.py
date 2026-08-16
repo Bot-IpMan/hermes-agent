@@ -7417,6 +7417,10 @@ class APIServerAdapter(BasePlatformAdapter):
                         status["error"] = graph_summary.get("retry_reason") or status.get("error")
                     elif graph_status == "PARTIAL":
                         status["error"] = graph_summary.get("saturation_reason") or status.get("error")
+                    elif graph_status == "RESUMABLE":
+                        if not status.get("error") or "database is locked" in str(status.get("error")):
+                            status["error"] = "CompanyIntel checkpoint is resumable"
+                        status["last_event"] = "run.resumable"
         except Exception:
             # Generic runs do not have a CompanyIntel graph. Their existing
             # status contract remains authoritative and must not be rerouted.
