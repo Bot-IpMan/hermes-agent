@@ -2324,8 +2324,17 @@ if _config_path.exists():
         _security_cfg = _cfg.get("security", {})
         if isinstance(_security_cfg, dict):
             _redact = _security_cfg.get("redact_secrets")
-            if _redact is not None:
-                os.environ["HERMES_REDACT_SECRETS"] = str(_redact).lower()
+            if isinstance(_redact, bool):
+                os.environ["HERMES_REDACT_SECRETS"] = "true" if _redact else "false"
+            elif _redact is not None:
+                # Treat malformed placeholders/strings as unsafe configuration.
+                # Never allow an invalid value to disable redaction.
+                _redact_text = str(_redact).strip().lower()
+                if _redact_text in {"true", "false", "1", "0", "yes", "no", "on", "off"}:
+                    os.environ["HERMES_REDACT_SECRETS"] = "true" if _redact_text in {"true", "1", "yes", "on"} else "false"
+                else:
+                    os.environ["HERMES_REDACT_SECRETS"] = "true"
+                    logging.getLogger(__name__).warning("Invalid security.redact_secrets value; secure redaction default enforced")
         # Gateway settings (media delivery allowlist + recency trust + strict mode)
         _gateway_cfg = _cfg.get("gateway", {})
         if isinstance(_gateway_cfg, dict):
@@ -11969,6 +11978,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             _redact_raw = os.getenv("HERMES_REDACT_SECRETS", "true")
             _redact_on = _redact_raw.lower() in {"1", "true", "yes", "on"}
+            if _redact_raw.strip().lower() not in {"1", "0", "true", "false", "yes", "no", "on", "off"}:
+                _redact_on = True
+                logging.getLogger(__name__).warning("Invalid HERMES_REDACT_SECRETS value; secure redaction default enforced")
             if _redact_on:
                 logger.info(
                     "Secret redaction: ENABLED (tool output, logs, and chat "

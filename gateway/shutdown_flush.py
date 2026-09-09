@@ -39,12 +39,16 @@ logger = logging.getLogger(__name__)
 
 def _get_flush_dir():
     """Return the pending-messages flush directory under the active HERMES_HOME."""
-    from hermes_constants import get_hermes_home
+    from hermes_constants import get_hermes_home, is_managed_profile_acl_path
 
     flush_dir = get_hermes_home() / "pending_messages"
-    flush_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # ``chmod(0700)`` changes the POSIX ACL mask to ``---``.  CompanyIntel
+    # explicitly grants the Project Agent group access to this profile, so
+    # retain the group class there while keeping ordinary profiles private.
+    directory_mode = 0o770 if is_managed_profile_acl_path(flush_dir) else 0o700
+    flush_dir.mkdir(parents=True, exist_ok=True, mode=directory_mode)
     if os.name == "posix":
-        os.chmod(flush_dir, 0o700)
+        os.chmod(flush_dir, directory_mode)
     return flush_dir
 
 
@@ -64,14 +68,19 @@ def _write_payload(flush_dir: Path, payload: Dict[str, Any]) -> Path:
 
     Returns the path of the published payload file.
     """
+    from hermes_constants import is_managed_profile_acl_path
     from utils import atomic_json_write
 
     file_id = uuid.uuid4().hex
     final_path = flush_dir / f"pending-{file_id}.json"
+    # atomic_json_write creates the temporary inode with this mode before the
+    # replace.  A 0600 temp inode would collapse an inherited ACL mask to
+    # ``---`` even if the destination directory has the correct defaults.
+    file_mode = 0o660 if is_managed_profile_acl_path(final_path) else 0o600
     atomic_json_write(
         final_path,
         payload,
-        mode=0o600,
+        mode=file_mode,
         default=str,
     )
 

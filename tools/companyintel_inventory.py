@@ -10,6 +10,7 @@ import hashlib
 import json
 import re
 import socket
+import time
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -26,6 +27,7 @@ class InventoryLimits:
     max_bytes_per_url: int = 256 * 1024
     max_total_bytes: int = 2 * 1024 * 1024
     timeout_seconds: float = 5.0
+    deadline_seconds: float = 120.0
     max_findings: int = 100
 
     def __post_init__(self) -> None:
@@ -35,6 +37,8 @@ class InventoryLimits:
             raise ValueError("max_bytes_per_url is outside the safe bound")
         if not self.max_bytes_per_url <= self.max_total_bytes <= 8 * 1024 * 1024:
             raise ValueError("max_total_bytes is outside the safe bound")
+        if not 5.0 <= self.deadline_seconds <= 600.0:
+            raise ValueError("deadline_seconds must be between 5 and 600")
         if not 1 <= self.max_findings <= 500:
             raise ValueError("max_findings must be between 1 and 500")
 
@@ -43,6 +47,42 @@ class InventoryLimits:
 class _Fetched:
     content_type: str
     body: bytes
+
+
+class InventoryFetchError(RuntimeError):
+    """Bounded, non-secret classification for a failed inventory fetch."""
+
+    def __init__(self, error_class: str, *, retryable: bool, detail: str = "") -> None:
+        super().__init__(error_class)
+        self.error_class = error_class
+        self.retryable = retryable
+        self.detail = " ".join(str(detail).split())[:240]
+
+
+def _fetch_error(exc: BaseException) -> InventoryFetchError:
+    """Map transport failures to stable classes without persisting raw errors."""
+    if isinstance(exc, urllib.error.HTTPError):
+        if exc.code == 429:
+            return InventoryFetchError("HTTP_429", retryable=True)
+        if exc.code in {408, 425, 500, 502, 503, 504}:
+            return InventoryFetchError(f"HTTP_{exc.code}", retryable=True)
+        return InventoryFetchError(f"HTTP_{exc.code}", retryable=False)
+    if isinstance(exc, urllib.error.URLError):
+        reason = str(getattr(exc, "reason", exc)).lower()
+        if "timed out" in reason or "timeout" in reason:
+            return InventoryFetchError("CONNECT_OR_READ_TIMEOUT", retryable=True)
+        if "reset" in reason or "refused" in reason or "temporarily" in reason:
+            return InventoryFetchError("CONNECTION_RESET_OR_REFUSED", retryable=True)
+        if "ssl" in reason or "certificate" in reason:
+            return InventoryFetchError("TLS_FAILURE", retryable=False)
+        if "name or service" in reason or "nodename" in reason or "dns" in reason:
+            return InventoryFetchError("DNS_FAILURE", retryable=False)
+        return InventoryFetchError("URL_ERROR", retryable=True)
+    if isinstance(exc, TimeoutError):
+        return InventoryFetchError("CONNECT_OR_READ_TIMEOUT", retryable=True)
+    if isinstance(exc, ConnectionError):
+        return InventoryFetchError("CONNECTION_RESET_OR_REFUSED", retryable=True)
+    return InventoryFetchError(type(exc).__name__.upper()[:64], retryable=False)
 
 
 class _HTMLInventoryParser(HTMLParser):
@@ -192,12 +232,25 @@ def _fetch_url(url: str, limits: InventoryLimits) -> tuple[str, bytes]:
     target = _public_url(url)
     request = urllib.request.Request(target, headers={"User-Agent": "Hermes-companyintel-inventory/1.0", "Accept": "text/html,application/xml,text/plain,*/*;q=0.1"})
     opener = urllib.request.build_opener(_SafeRedirect(_site_host(target)))
-    with opener.open(request, timeout=limits.timeout_seconds) as response:
-        content_type = response.headers.get_content_type() if response.headers else ""
-        body = response.read(limits.max_bytes_per_url + 1)
-        if len(body) > limits.max_bytes_per_url:
-            body = body[:limits.max_bytes_per_url]
-        return content_type, body
+    attempts = 3
+    deadline_at = time.monotonic() + min(600.0, max(5.0, float(limits.deadline_seconds)))
+    last_error: InventoryFetchError | None = None
+    for attempt in range(attempts):
+        remaining = deadline_at - time.monotonic()
+        if remaining <= 0:
+            raise InventoryFetchError("INVENTORY_DEADLINE_EXCEEDED", retryable=True)
+        try:
+            with opener.open(request, timeout=min(float(limits.timeout_seconds), remaining)) as response:
+                content_type = response.headers.get_content_type() if response.headers else ""
+                body = response.read(limits.max_bytes_per_url + 1)
+                if len(body) > limits.max_bytes_per_url:
+                    body = body[:limits.max_bytes_per_url]
+                return content_type, body
+        except Exception as exc:
+            last_error = _fetch_error(exc)
+            if not last_error.retryable or attempt + 1 >= attempts:
+                raise last_error from exc
+    raise last_error or InventoryFetchError("URL_ERROR", retryable=True)
 
 
 def _text(body: bytes) -> str:
@@ -250,20 +303,34 @@ def extract_inventory(
     discovered_sources: list[str] = []
     jsonld: list[dict] = []
     observations: list[dict[str, str]] = []
+    deadline_at = time.monotonic() + min(600.0, max(5.0, float(limits.deadline_seconds)))
 
     def add_observation(node_type: str, value: str, source_url: str, excerpt: str) -> None:
         if len(observations) < limits.max_findings:
             observations.append({"node_type": node_type, "value": value, "source_url": source_url, "excerpt": _excerpt(excerpt)})
 
     while queue and len(fetched) < limits.max_urls and total_bytes < limits.max_total_bytes:
+        if time.monotonic() >= deadline_at:
+            errors.append({"url": target, "error": "INVENTORY_DEADLINE_EXCEEDED", "retryable": "true"})
+            break
         url = queue.pop(0)
         if url in fetched or not _same_site(url, target_host):
             continue
         fetched.add(url)
         try:
             content_type, body = fetcher(url, limits)
+        except InventoryFetchError as exc:
+            row = {"url": url, "error": exc.error_class, "retryable": str(exc.retryable).lower()}
+            if exc.detail:
+                row["detail"] = exc.detail
+            errors.append(row)
+            continue
         except Exception as exc:
-            errors.append({"url": url, "error": type(exc).__name__})
+            classified = _fetch_error(exc)
+            row = {"url": url, "error": classified.error_class, "retryable": str(classified.retryable).lower()}
+            if classified.detail:
+                row["detail"] = classified.detail
+            errors.append(row)
             continue
         source_types[url] = content_type
         total_bytes += len(body)

@@ -18,15 +18,15 @@ class SourceClass:
 
 
 SOURCE_MATRIX: tuple[SourceClass, ...] = (
-    SourceClass("marketplace", "marketplace_search", False, "SKIPPED_UNSUPPORTED", "provider-specific marketplace adapter not configured"),
-    SourceClass("maps", "maps_search", False, "SKIPPED_UNSUPPORTED", "provider-specific maps adapter not configured"),
-    SourceClass("social", "not_implemented", False, "SKIPPED_UNSUPPORTED", "no bounded social adapter"),
-    SourceClass("wayback", "not_implemented", False, "SKIPPED_UNSUPPORTED", "archive adapter not configured"),
-    SourceClass("rdap_dns_ct", "not_implemented", False, "SKIPPED_UNSUPPORTED", "network identity adapter not configured"),
-    SourceClass("official_registry", "not_implemented", False, "SKIPPED_UNSUPPORTED", "authoritative query contract unavailable"),
-    SourceClass("prozorro_spending", "not_implemented", False, "SKIPPED_UNSUPPORTED", "bounded local/import contract unavailable"),
-    SourceClass("court_ip", "not_implemented", False, "SKIPPED_UNSUPPORTED", "source requires a reviewed provider contract"),
-    SourceClass("reverse_image", "not_implemented", False, "SKIPPED_UNSUPPORTED", "no approved provider/tool available"),
+    SourceClass("marketplace", "marketplace_search", False, "CAPABILITY_UNAVAILABLE", "provider-specific marketplace adapter not configured"),
+    SourceClass("maps", "maps_search", False, "CAPABILITY_UNAVAILABLE", "provider-specific maps adapter not configured"),
+    SourceClass("social", "not_implemented", False, "CAPABILITY_UNAVAILABLE", "no bounded social adapter"),
+    SourceClass("wayback", "not_implemented", False, "CAPABILITY_UNAVAILABLE", "archive adapter not configured"),
+    SourceClass("rdap_dns_ct", "not_implemented", False, "CAPABILITY_UNAVAILABLE", "network identity adapter not configured"),
+    SourceClass("official_registry", "not_implemented", False, "CAPABILITY_UNAVAILABLE", "authoritative query contract unavailable"),
+    SourceClass("prozorro_spending", "not_implemented", False, "CAPABILITY_UNAVAILABLE", "bounded local/import contract unavailable"),
+    SourceClass("court_ip", "not_implemented", False, "CAPABILITY_UNAVAILABLE", "source requires a reviewed provider contract"),
+    SourceClass("reverse_image", "not_implemented", False, "CAPABILITY_UNAVAILABLE", "no approved provider/tool available"),
 )
 
 

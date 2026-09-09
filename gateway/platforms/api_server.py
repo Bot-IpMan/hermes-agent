@@ -154,34 +154,154 @@ def _companyintel_initialize_graph(run_id: str, message: Any, *, target_url: Opt
         from tools.companyintel_graph_tool import companyintel_graph
         result = json.loads(companyintel_graph({"action": "init_run", "run_id": run_id, "target_url": target_url}))
         if not result.get("ok"):
+            detail = result.get("error_detail") or {}
+            if isinstance(detail, dict) and detail.get("code"):
+                return f"{detail.get('code')}; stage={detail.get('stage', 'preflight')}"
             return result.get("error", "graph initialization failed")
     except Exception as exc:
         return f"graph initialization failed: {exc}"
     return None
 
 
+def _companyintel_search_preflight() -> Dict[str, Any]:
+    """Return a bounded, non-secret readiness result for run admission."""
+    try:
+        from tools.companyintel_public_search import provider_readiness
+
+        readiness = provider_readiness()
+    except Exception as exc:
+        logger.warning("CompanyIntel search preflight could not resolve readiness: %s", exc)
+        readiness = {
+            "provider": "none",
+            "registered": False,
+            "supports_search": False,
+            "credentials_available": False,
+            "ready": False,
+            "reason": "provider readiness check failed",
+        }
+    allowed = {
+        "provider",
+        "registered",
+        "supports_search",
+        "configured",
+        "credentials_available",
+        "authenticated",
+        "reachable",
+        "ready",
+        "reason",
+    }
+    bounded = {key: readiness.get(key) for key in allowed}
+    bounded["provider"] = str(bounded.get("provider") or "none")[:64]
+    bounded["reason"] = _redact_api_error_text(
+        bounded.get("reason") or "search provider unavailable",
+        limit=256,
+    )
+    for key in ("registered", "supports_search", "configured", "credentials_available", "authenticated", "reachable", "ready"):
+        bounded[key] = bool(bounded.get(key))
+    return bounded
+
+
+def _companyintel_report_error(result: Dict[str, Any], fallback: str) -> tuple[str, Dict[str, Any]]:
+    """Extract a bounded structured report error without leaking provider data."""
+    raw = result.get("error_detail") or result.get("error") or result.get("reason")
+    if isinstance(raw, dict):
+        nested_retryable = bool(raw["retryable"]) if "retryable" in raw else None
+        outer_retryable = bool(result.get("retryable", False))
+        if nested_retryable is not None and nested_retryable != outer_retryable:
+            logger.warning(
+                "CompanyIntel reasoning retryability mismatch code=%s stage=%s nested=%s outer=%s",
+                str(raw.get("code") or "COMPANYINTEL_REPORT_FAILED")[:96],
+                str(raw.get("failure_stage") or raw.get("stage") or "report")[:64],
+                nested_retryable,
+                outer_retryable,
+            )
+        detail = {
+            "code": str(raw.get("code") or "COMPANYINTEL_REPORT_FAILED")[:96],
+            "message": str(raw.get("message") or fallback)[:512],
+            "stage": str(raw.get("stage") or result.get("stage") or "report")[:64],
+            "failure_stage": str(raw.get("failure_stage") or raw.get("stage") or result.get("stage") or "report")[:64],
+            "retryable": nested_retryable if nested_retryable is not None else outer_retryable,
+        }
+        for key, limit in (("cause_class", 96), ("error_fingerprint", 128), ("provider_request_id", 128)):
+            if raw.get(key):
+                detail[key] = _redact_api_error_text(raw[key], limit=limit)
+        for key in ("resumable", "durable_status"):
+            if key in raw:
+                detail[key] = bool(raw[key]) if key == "resumable" else str(raw[key])[:32]
+        for key in ("failed_checks", "missing_capabilities", "recommended_actions"):
+            values = raw.get(key)
+            if isinstance(values, list):
+                detail[key] = [str(item)[:120] for item in values[:32]]
+        if raw.get("retry_after") is not None:
+            try:
+                detail["retry_after"] = max(0.0, min(float(raw["retry_after"]), 30.0))
+            except (TypeError, ValueError):
+                pass
+    else:
+        detail = {
+            "code": str(result.get("code") or "COMPANYINTEL_REPORT_FAILED")[:96],
+            "message": str(raw or fallback)[:512],
+            "stage": str(result.get("stage") or "report")[:64],
+            "failure_stage": str(result.get("failure_stage") or result.get("stage") or "report")[:64],
+            "retryable": bool(result.get("retryable")),
+        }
+        for key, limit in (("cause_class", 96), ("error_fingerprint", 128), ("provider_request_id", 128)):
+            if result.get(key):
+                detail[key] = _redact_api_error_text(result[key], limit=limit)
+        for key in ("resumable", "durable_status"):
+            if key in result:
+                detail[key] = bool(result[key]) if key == "resumable" else str(result[key])[:32]
+        for key in ("failed_checks", "missing_capabilities", "recommended_actions"):
+            values = result.get(key)
+            if isinstance(values, list):
+                detail[key] = [str(item)[:120] for item in values[:32]]
+    message = _redact_api_error_text(detail["message"])
+    code = detail["code"]
+    stage = detail["stage"]
+    failure_stage = detail.get("failure_stage")
+    suffix = f"{code}; stage={stage}"
+    if failure_stage and failure_stage != stage:
+        suffix += f"; failure_stage={failure_stage}"
+    return f"{message} [{suffix}]", {**detail, "message": message}
+
+
+def _companyintel_deferred_lifecycle(result: Dict[str, Any]) -> tuple[str, str, str]:
+    """Map a deferred result using its authoritative durable status."""
+    durable_status = str(result.get("durable_status") or "").upper()
+    is_partial = bool(result.get("partial"))
+    if durable_status not in {"RETRY_WAIT", "RESUMABLE", "PARTIAL"}:
+        durable_status = "PARTIAL" if is_partial else ("RETRY_WAIT" if bool(result.get("retryable")) else "RESUMABLE")
+    event_name = {
+        "PARTIAL": "run.partial",
+        "RESUMABLE": "run.resumable",
+        "RETRY_WAIT": "run.retry_wait",
+    }[durable_status]
+    return durable_status.lower(), durable_status, event_name
+
+
+def _companyintel_should_stop_automatic_batches(summary: Dict[str, Any]) -> bool:
+    """Stop automatic work at a durable pause or any recorded saturation boundary."""
+    durable_status = str(summary.get("status") or "").upper()
+    return durable_status in {"PARTIAL", "RESUMABLE"} or bool(summary.get("saturation_reason"))
+
+
 def _companyintel_pre_report_gate(run_id: str, profile: Optional[str]) -> Optional[str]:
-    """Reject a successful report unless durable graph state exists."""
+    """Ensure the durable graph exists before report persistence begins.
+
+    Evidence quality is evaluated by ``generate_report`` in the graph runtime,
+    which returns the machine-readable failed_checks/missing_capabilities
+    contract. This API guard must not replace that decision with a generic
+    synthesis error before synthesis has even started.
+    """
     if profile != "companyintel":
         return None
     try:
         from tools.companyintel_graph_tool import companyintel_graph
         result = json.loads(companyintel_graph({"action": "summary", "run_id": run_id}))
     except Exception as exc:
-        return f"companyintel pre-report gate unavailable: {exc}"
+        return f"companyintel pre-report graph unavailable: {exc}"
     if not result.get("ok"):
         return result.get("error", "companyintel graph summary failed")
-    if result.get("nodes", 0) < 1 or result.get("evidence", 0) < 1:
-        return (
-            "companyintel pre-report gate blocked completion: durable graph requires "
-            f"at least one node and evidence (nodes={result.get('nodes', 0)}, "
-            f"evidence={result.get('evidence', 0)})"
-        )
-    if result.get("frontier_open", 0) > 0 and not result.get("saturation_reason"):
-        return (
-            "companyintel pre-report gate blocked completion: frontier is not exhausted "
-            f"(frontier_open={result.get('frontier_open', 0)})"
-        )
     return None
 
 
@@ -984,9 +1104,17 @@ class ResponseStore:
         self._tighten_file_permissions()
 
     def _tighten_file_permissions(self) -> None:
-        """Force owner-only permissions on the DB and SQLite sidecars."""
+        """Apply the appropriate permissions to the DB and SQLite sidecars.
+
+        Response history is owner-only for ordinary Hermes profiles. The
+        dedicated CompanyIntel profile is intentionally shared with the
+        ``lookdata-dev`` group, so forcing 0600 here would collapse its ACL
+        mask and make the profile fail closed on every gateway restart.
+        """
         if not self._db_path:
             return
+        from hermes_constants import is_managed_profile_acl_path
+
         for candidate in (
             Path(self._db_path),
             Path(f"{self._db_path}-wal"),
@@ -994,7 +1122,8 @@ class ResponseStore:
         ):
             try:
                 if candidate.exists():
-                    candidate.chmod(0o600)
+                    mode = 0o660 if is_managed_profile_acl_path(candidate) else 0o600
+                    candidate.chmod(mode)
             except OSError:
                 logger.debug(
                     "Failed to restrict response store permissions for %s",
@@ -6730,6 +6859,22 @@ class APIServerAdapter(BasePlatformAdapter):
         target_url = _companyintel_target_url_from_request(body, user_message)
         if request_profile == "companyintel" and not target_url:
             return web.json_response(_openai_error("CompanyIntel requires explicit 'target_url' (https://...)"), status=400)
+        if request_profile == "companyintel":
+            with self._profile_scope(request_profile):
+                readiness = _companyintel_search_preflight()
+            if not readiness["ready"]:
+                error = _openai_error(
+                    "CompanyIntel search provider is not configured or available",
+                    err_type="service_unavailable_error",
+                    code="COMPANYINTEL_SEARCH_PROVIDER_UNAVAILABLE",
+                )
+                error.update({
+                    "stage": "preflight",
+                    "retryable": False,
+                    "resumable": False,
+                    "provider_readiness": readiness,
+                })
+                return web.json_response(error, status=503)
         previous_response_id = body.get("previous_response_id")
         # Precedence: explicit conversation_history > previous_response_id.
         conversation_history: List[Dict[str, str]] = []
@@ -6964,9 +7109,15 @@ class APIServerAdapter(BasePlatformAdapter):
                                         "reasoning_enabled": True,
                                     }))
                                     if not automatic_result.get("ok"):
+                                        frontier_summary = json.loads(companyintel_graph({"action": "summary", "run_id": run_id}))
+                                        if str(frontier_summary.get("status") or "").upper() in {"PARTIAL", "RETRY_WAIT", "RESUMABLE"}:
+                                            companyintel_batches.append(automatic_result)
+                                            break
                                         raise RuntimeError(automatic_result.get("error", "companyintel automatic pivot execution failed"))
                                     companyintel_batches.append(automatic_result)
                                     frontier_summary = json.loads(companyintel_graph({"action": "summary", "run_id": run_id}))
+                                    if _companyintel_should_stop_automatic_batches(frontier_summary):
+                                        break
                                     if frontier_summary.get("status") == "RETRY_WAIT":
                                         retry_at = float(frontier_summary.get("retry_at") or time.time())
                                         _put_event_if_active({
@@ -6997,10 +7148,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                         if not resumed.get("ok") and resumed.get("status") != "RETRY_WAIT":
                                             raise RuntimeError(resumed.get("error", resumed.get("reason", "companyintel durable resume failed")))
                                         frontier_summary = json.loads(companyintel_graph({"action": "summary", "run_id": run_id}))
-                                    if frontier_summary.get("frontier_open", 0) == 0 or (
-                                        frontier_summary.get("saturation_reason")
-                                        and frontier_summary.get("saturation_reason") != "BUDGET_EXHAUSTED:max_tasks"
-                                    ):
+                                    if _companyintel_should_stop_automatic_batches(frontier_summary) or frontier_summary.get("frontier_open", 0) == 0:
                                         break
                                 frontier_summary = json.loads(companyintel_graph({"action": "summary", "run_id": run_id}))
                                 if frontier_summary.get("status") in {"RETRY_WAIT", "RESUMABLE", "PARTIAL"} and frontier_summary.get("frontier_open", 0) > 0:
@@ -7010,6 +7158,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                         "review_text": "",
                                         "deferred": True,
                                         "partial": saturation_reason.startswith("BUDGET_EXHAUSTED:"),
+                                        "durable_status": frontier_summary.get("status"),
                                         "reason": frontier_summary.get("retry_reason") or saturation_reason,
                                     }, {}
                                 report_result = json.loads(companyintel_graph({
@@ -7019,12 +7168,27 @@ class APIServerAdapter(BasePlatformAdapter):
                                     "terminal_transition_pending": True,
                                 }))
                                 if not report_result.get("ok"):
-                                    raise RuntimeError(report_result.get("reason", "companyintel report synthesis/review failed"))
+                                    error_msg, error_detail = _companyintel_report_error(report_result, "companyintel report synthesis/review failed")
+                                    if error_detail.get("retryable") or report_result.get("durable_status") in {"RETRY_WAIT", "RESUMABLE", "PARTIAL"}:
+                                        can_resume = bool(error_detail.get("resumable") or report_result.get("resumable"))
+                                        return {
+                                            "final_response": "CompanyIntel report generation paused; resume is available." if can_resume else "CompanyIntel pre-report quality gate rejected the collected evidence.",
+                                            "review_text": "",
+                                            "deferred": True,
+                                            "durable_status": report_result.get("durable_status") or "PARTIAL",
+                                            "resumable": can_resume,
+                                            "reason": error_msg,
+                                            "error_detail": error_detail,
+                                        }, {}
+                                    raise RuntimeError(error_msg)
                                 artifact = report_result.get("report", {})
                                 return {
-                                    "final_response": artifact.get("report_text", "CompanyIntel report completed."),
+                                    "final_response": artifact.get("report_text", artifact.get("text", "CompanyIntel report completed.")),
                                     "review_text": artifact.get("review_text", ""),
+                                    "review_verdict": artifact.get("review_verdict", ""),
+                                    "review_findings": artifact.get("review_findings", []),
                                     "companyintel_report_ready": True,
+                                    "companyintel_report": artifact,
                                 }, {}
                             # /v1/runs runs its own agent lifecycle (no
                             # TurnRunner, no _run_agent) — record turn process
@@ -7123,12 +7287,17 @@ class APIServerAdapter(BasePlatformAdapter):
                 else:
                     if request_profile == "companyintel" and isinstance(result, dict) and result.get("deferred"):
                         deferred_reason = _redact_api_error_text(result.get("reason") or "companyintel durable retry/resume pending")
-                        is_partial = bool(result.get("partial"))
-                        api_status = "partial" if is_partial else "retry_wait"
-                        graph_status = "PARTIAL" if is_partial else "RETRY_WAIT"
-                        event_name = "run.partial" if is_partial else "run.retry_wait"
-                        self._set_run_status(run_id, api_status, error=deferred_reason, last_event=event_name)
-                        _put_event_if_active({"event": event_name, "run_id": run_id, "timestamp": time.time(), "error": deferred_reason})
+                        api_status, graph_status, event_name = _companyintel_deferred_lifecycle(result)
+                        deferred_detail = result.get("error_detail") if isinstance(result.get("error_detail"), dict) else {}
+                        self._set_run_status(
+                            run_id, api_status, error=deferred_reason, last_event=event_name,
+                            retry_at=result.get("retry_at"), retry_reason=deferred_reason,
+                            resumable=bool(result.get("resumable") or deferred_detail.get("resumable")),
+                            failed_checks=deferred_detail.get("failed_checks", []),
+                            missing_capabilities=deferred_detail.get("missing_capabilities", []),
+                            recommended_actions=deferred_detail.get("recommended_actions", []),
+                        )
+                        _put_event_if_active({"event": event_name, "run_id": run_id, "timestamp": time.time(), "error": deferred_reason, "error_detail": result.get("error_detail")})
                         transition_error = _companyintel_transition_graph(run_id, request_profile, graph_status, deferred_reason)
                         if transition_error:
                             transition_error = _redact_api_error_text(transition_error)
@@ -7136,23 +7305,29 @@ class APIServerAdapter(BasePlatformAdapter):
                             self._set_run_status(run_id, "failed", error=transition_error, last_event="run.failed")
                             _put_event_if_active({"event": "run.failed", "run_id": run_id, "timestamp": time.time(), "error": transition_error})
                         return
-                    gate_error = _companyintel_pre_report_gate(run_id, request_profile)
-                    if gate_error:
-                        error_msg = _redact_api_error_text(gate_error)
-                        _put_event_if_active({
-                            "event": "run.failed",
-                            "run_id": run_id,
-                            "timestamp": time.time(),
-                            "error": error_msg,
-                        })
-                        self._set_run_status(
-                            run_id,
-                            "failed",
-                            error=error_msg,
-                            last_event="run.failed",
-                        )
-                        _companyintel_transition_graph(run_id, request_profile, "FAILED", error_msg)
-                        return
+                    companyintel_report_ready = bool(
+                        request_profile == "companyintel"
+                        and isinstance(result, dict)
+                        and result.get("companyintel_report_ready")
+                    )
+                    if not companyintel_report_ready:
+                        gate_error = _companyintel_pre_report_gate(run_id, request_profile)
+                        if gate_error:
+                            error_msg = _redact_api_error_text(gate_error)
+                            _put_event_if_active({
+                                "event": "run.failed",
+                                "run_id": run_id,
+                                "timestamp": time.time(),
+                                "error": error_msg,
+                            })
+                            self._set_run_status(
+                                run_id,
+                                "failed",
+                                error=error_msg,
+                                last_event="run.failed",
+                            )
+                            _companyintel_transition_graph(run_id, request_profile, "FAILED", error_msg)
+                            return
                     final_response = result.get("final_response", "") if isinstance(result, dict) else ""
                     quality_error = (
                         _companyintel_incomplete_output_reason(final_response)
@@ -7176,21 +7351,33 @@ class APIServerAdapter(BasePlatformAdapter):
                         )
                         _companyintel_transition_graph(run_id, request_profile, "FAILED", error_msg)
                         return
-                    if request_profile == "companyintel":
+                    if request_profile == "companyintel" and not companyintel_report_ready:
                         from tools.companyintel_graph_tool import companyintel_graph
                         report_result = json.loads(companyintel_graph({
                             "action": "generate_report",
                             "run_id": run_id,
                             "report_text": final_response,
                             "review_text": result.get("review_text", "") if isinstance(result, dict) else "",
+                            "review_verdict": result.get("review_verdict", "") if isinstance(result, dict) else "",
+                            "review_findings": result.get("review_findings", []) if isinstance(result, dict) else [],
                             "model": agent_overrides.get("requested_model") or self._model_name,
                             "provider": agent_overrides.get("requested_provider") or "",
                             "reasoning_enabled": True,
                             "terminal_transition_pending": True,
                         }))
                         if not report_result.get("ok"):
-                            error_msg = _redact_api_error_text(report_result.get("reason", "companyintel report persistence failed"))
-                            _put_event_if_active({"event": "run.failed", "run_id": run_id, "timestamp": time.time(), "error": error_msg})
+                            error_msg, error_detail = _companyintel_report_error(report_result, "companyintel report persistence failed")
+                            if error_detail.get("retryable") or report_result.get("durable_status") in {"RETRY_WAIT", "RESUMABLE", "PARTIAL"}:
+                                api_status, graph_status, event_name = _companyintel_deferred_lifecycle(report_result)
+                                self._set_run_status(run_id, api_status, error=error_msg, last_event=event_name, retry_at=report_result.get("retry_at"), retry_reason=error_msg)
+                                _put_event_if_active({"event": event_name, "run_id": run_id, "timestamp": time.time(), "error": error_msg, "error_detail": error_detail})
+                                transition_error = _companyintel_transition_graph(run_id, request_profile, graph_status, error_msg)
+                                if transition_error:
+                                    transition_error = _redact_api_error_text(transition_error)
+                                    self._set_run_status(run_id, "failed", error=transition_error, last_event="run.failed")
+                                    _put_event_if_active({"event": "run.failed", "run_id": run_id, "timestamp": time.time(), "error": transition_error})
+                                return
+                            _put_event_if_active({"event": "run.failed", "run_id": run_id, "timestamp": time.time(), "error": error_msg, "error_detail": error_detail})
                             self._set_run_status(run_id, "failed", error=error_msg, last_event="run.failed")
                             _companyintel_transition_graph(run_id, request_profile, "FAILED", error_msg)
                             return
@@ -7329,8 +7516,17 @@ class APIServerAdapter(BasePlatformAdapter):
         response_headers = (
             {"X-Hermes-Session-Key": gateway_session_key} if gateway_session_key else {}
         )
+        response = {"run_id": run_id, "status": "started"}
+        if request_profile == "companyintel":
+            # This API is a distinct execution plane from LookData worker
+            # ``/jobs``. Keep the durable-store owner unambiguous at admission.
+            response.update({
+                "execution_plane": "hermes",
+                "hermes_run_id": run_id,
+                "profile": "companyintel",
+            })
         return web.json_response(
-            {"run_id": run_id, "status": "started"},
+            response,
             status=202,
             headers=response_headers,
         )
@@ -7430,6 +7626,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     status = dict(status)
                     status["profile"] = "companyintel"
                     status["status"] = graph_status.lower()
+                    status["resumable"] = graph_status in {"RETRY_WAIT", "RESUMABLE"} or (graph_status == "PARTIAL" and int(graph_summary.get("frontier_open", 0) or 0) > 0)
                     status["updated_at"] = status.get("updated_at") or time.time()
                     if graph_status == "RETRY_WAIT":
                         status["error"] = graph_summary.get("retry_reason") or status.get("error")

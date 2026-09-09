@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from gateway.restart import GATEWAY_SERVICE_RESTART_EXIT_CODE
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, is_managed_profile_acl_path
 from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
@@ -265,7 +265,11 @@ def write_loop_heartbeat(
     if extra:
         payload.update(extra)
     try:
-        atomic_json_write(path, payload, indent=None)
+        # The managed profile has a named Project Agent ACL.  Supplying the
+        # mode at temp-inode creation time preserves its rw- mask across the
+        # atomic replace; generic Hermes heartbeats remain owner-only.
+        mode = 0o660 if is_managed_profile_acl_path(path) else 0o600
+        atomic_json_write(path, payload, indent=None, mode=mode)
     except Exception:
         logger.debug("Failed to write gateway loop heartbeat", exc_info=True)
     return path

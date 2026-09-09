@@ -12,23 +12,49 @@ import os
 import re
 import secrets
 import sqlite3
-import tempfile
 import time
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
 from hermes_constants import get_hermes_home
 from tools.registry import registry
+from tools.openrouter_client import OpenRouterClientError
+from tools.companyintel_artifact_adapter import (
+    ArtifactFailure,
+    DEFAULT_READER_PRINCIPAL,
+    classify_artifact,
+    publish_text,
+)
 from companyintel.schema import RELATIONS, SCHEMA_VERSION, _endpoint_allowed, deterministic_id, validate_graph
+from tools.companyintel_source_classifier import classify_source
+from tools.companyintel_document_extraction import ExtractionError, ExtractionLimits, extract_url
 
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _ALLOWED_NODE_TYPES = {
     "domain", "url", "phone", "email", "address", "place", "brand", "legal_entity",
-    "legal_entity_candidate", "official_registry", "person", "document", "image", "favicon", "marketplace_profile",
+    "legal_entity_candidate", "official_registry", "person", "document", "image", "favicon", "marketplace_profile", "finding",
     "social_profile", "analytics_id", "merchant_id", "iban", "legal_id",
     "product", "organization_candidate",
 }
+_IDENTITY_FOCUSED_PIVOTS = frozenset({"exact_search", "documents", "maps", "marketplaces", "official_registry"})
+_MAX_PIVOTS_PER_NODE = 6
+_MAX_OPEN_FRONTIER_TASKS_PER_RUN = 64
+_SEARCH_PIVOT_TYPES = frozenset({"exact_search", "maps", "marketplaces", "documents"})
+REASONING_PROVIDER = "openai-codex"
+REASONING_MODEL = "gpt-5.6-luna"
+
+
+def _reasoning_route_metadata() -> tuple[str, str]:
+    """Return safe route metadata for durable placeholders and failures."""
+    try:
+        from tools.openrouter_client import get_reasoning_route
+
+        provider, model = get_reasoning_route()
+        return provider, model
+    except Exception:
+        return REASONING_PROVIDER, REASONING_MODEL
 
 
 def _home() -> Path:
@@ -87,11 +113,21 @@ def _run_dir(run_id: str) -> Path:
     return _home() / "companyintel" / "runs" / run_id
 
 
-def _connect(run_id: str) -> sqlite3.Connection:
+def _connect(run_id: str, *, create: bool = False) -> sqlite3.Connection:
+    """Open an initialized-run database without creating orphan state.
+
+    Only ``init_run`` may pass ``create=True``. Every other graph operation
+    must fail before filesystem mutation when a run has not been admitted.
+    """
+    if not _RUN_ID_RE.fullmatch(run_id):
+        raise ValueError("run_id is required and must be safe")
     run_dir = _run_dir(run_id)
     db_path = run_dir / "graph.sqlite3"
     preexisting_db = db_path.exists()
-    run_dir.mkdir(parents=True, exist_ok=True)
+    if not preexisting_db and not create:
+        raise ValueError("run is not initialized")
+    if create:
+        run_dir.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path, timeout=60)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=60000")
@@ -99,7 +135,19 @@ def _connect(run_id: str) -> sqlite3.Connection:
     # mode on every projection/event connection takes a writer lock and races
     # with run startup. Only bootstrap a new database here.
     if not preexisting_db:
-        conn.execute("PRAGMA journal_mode=WAL")
+        # Multiple admitted workers can bootstrap the same run concurrently.
+        # SQLite may briefly reject the journal-mode writer even with
+        # busy_timeout; retry only this bounded bootstrap operation rather
+        # than surfacing a spurious database-locked failure.
+        journal_deadline = time.monotonic() + 60.0
+        while True:
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                break
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or time.monotonic() >= journal_deadline:
+                    raise
+                time.sleep(0.05)
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(
         """
@@ -125,7 +173,12 @@ def _connect(run_id: str) -> sqlite3.Connection:
             retry_at REAL,
             retry_reason TEXT,
             retry_count INTEGER NOT NULL DEFAULT 0,
-            resume_count INTEGER NOT NULL DEFAULT 0
+            resume_count INTEGER NOT NULL DEFAULT 0,
+            execution_generation INTEGER NOT NULL DEFAULT 0,
+            graph_revision TEXT NOT NULL DEFAULT '',
+            last_stop_reason TEXT,
+            checkpoint_reason TEXT,
+            terminal_reason TEXT
         );
         CREATE TABLE IF NOT EXISTS nodes (
             node_id TEXT PRIMARY KEY,
@@ -149,7 +202,10 @@ def _connect(run_id: str) -> sqlite3.Connection:
             excerpt TEXT NOT NULL,
             content_sha256 TEXT NOT NULL,
             retrieval_method TEXT NOT NULL,
-            access_status TEXT NOT NULL
+            access_status TEXT NOT NULL,
+            source_class TEXT NOT NULL DEFAULT 'search_snippet',
+            authority_reason TEXT NOT NULL DEFAULT 'unknown_origin_fail_closed',
+            parent_search_id TEXT NOT NULL DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS edges (
             edge_id TEXT PRIMARY KEY,
@@ -196,7 +252,23 @@ def _connect(run_id: str) -> sqlite3.Connection:
             source TEXT NOT NULL,
             status TEXT NOT NULL,
             new_node_ids TEXT NOT NULL DEFAULT '[]',
-            limitation TEXT
+            limitation TEXT,
+            provider TEXT NOT NULL DEFAULT '',
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            query_key TEXT NOT NULL DEFAULT '',
+            technical_error TEXT
+        );
+        CREATE INDEX IF NOT EXISTS search_log_query_idx
+            ON search_log(round, query_key);
+        CREATE TABLE IF NOT EXISTS search_provider_circuits (
+            run_id TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            state TEXT NOT NULL,
+            reason TEXT NOT NULL DEFAULT '',
+            opened_at TEXT NOT NULL,
+            retry_at REAL,
+            failure_count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(run_id, provider)
         );
         CREATE TABLE IF NOT EXISTS identity_candidates (
             candidate_id TEXT PRIMARY KEY,
@@ -216,6 +288,21 @@ def _connect(run_id: str) -> sqlite3.Connection:
         );
         CREATE INDEX IF NOT EXISTS identity_candidates_run_idx
             ON identity_candidates(run_id, score DESC, updated_at DESC);
+        CREATE TABLE IF NOT EXISTS findings (
+            finding_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            finding_type TEXT NOT NULL,
+            subject_node_ids TEXT NOT NULL DEFAULT '[]',
+            supporting_evidence_ids TEXT NOT NULL DEFAULT '[]',
+            confidence REAL NOT NULL,
+            status TEXT NOT NULL,
+            rule_version TEXT NOT NULL,
+            contradiction_group TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(run_id, finding_id)
+        );
+        CREATE INDEX IF NOT EXISTS findings_run_idx ON findings(run_id, status, updated_at DESC);
         CREATE TABLE IF NOT EXISTS worker_checkpoints (
             checkpoint_id TEXT PRIMARY KEY,
             run_id TEXT NOT NULL,
@@ -247,6 +334,35 @@ def _connect(run_id: str) -> sqlite3.Connection:
             created_at TEXT NOT NULL,
             PRIMARY KEY(run_id, event_id)
         );
+        CREATE TABLE IF NOT EXISTS convergence_snapshots (
+            snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            execution_generation INTEGER NOT NULL DEFAULT 0,
+            reason TEXT NOT NULL,
+            tasks_attempted INTEGER NOT NULL DEFAULT 0,
+            tasks_completed INTEGER NOT NULL DEFAULT 0,
+            new_nodes INTEGER NOT NULL DEFAULT 0,
+            new_typed_entities INTEGER NOT NULL DEFAULT 0,
+            new_findings INTEGER NOT NULL DEFAULT 0,
+            new_evidence INTEGER NOT NULL DEFAULT 0,
+            new_identity_candidates INTEGER NOT NULL DEFAULT 0,
+            new_verified_edges INTEGER NOT NULL DEFAULT 0,
+            frontier_spawned INTEGER NOT NULL DEFAULT 0,
+            nodes_total INTEGER NOT NULL DEFAULT 0,
+            typed_entities_total INTEGER NOT NULL DEFAULT 0,
+            findings_total INTEGER NOT NULL DEFAULT 0,
+            evidence_total INTEGER NOT NULL DEFAULT 0,
+            identity_candidates_total INTEGER NOT NULL DEFAULT 0,
+            verified_edges_total INTEGER NOT NULL DEFAULT 0,
+            frontier_tasks_total INTEGER NOT NULL DEFAULT 0,
+            evidence_gain_per_task REAL NOT NULL DEFAULT 0,
+            candidate_gain_per_task REAL NOT NULL DEFAULT 0,
+            frontier_spawn_ratio REAL NOT NULL DEFAULT 0,
+            low_information_gain INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS convergence_snapshots_latest_idx
+            ON convergence_snapshots(run_id, execution_generation, snapshot_id DESC);
         CREATE UNIQUE INDEX IF NOT EXISTS run_events_idempotency_idx
             ON run_events(run_id, idempotency_key)
             WHERE idempotency_key <> '';
@@ -264,6 +380,20 @@ def _connect(run_id: str) -> sqlite3.Connection:
         );
         CREATE INDEX IF NOT EXISTS report_artifacts_run_idx
             ON report_artifacts(run_id, generated_at DESC);
+        CREATE TABLE IF NOT EXISTS report_drafts (
+            draft_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            graph_revision TEXT NOT NULL,
+            draft_json TEXT NOT NULL,
+            model TEXT NOT NULL DEFAULT '',
+            provider TEXT NOT NULL DEFAULT '',
+            stage TEXT NOT NULL,
+            generated_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(run_id, graph_revision)
+        );
+        CREATE INDEX IF NOT EXISTS report_drafts_run_idx
+            ON report_drafts(run_id, updated_at DESC);
         CREATE TABLE IF NOT EXISTS reasoning_decisions (
             decision_id TEXT PRIMARY KEY,
             run_id TEXT NOT NULL,
@@ -306,6 +436,26 @@ def _connect(run_id: str) -> sqlite3.Connection:
         );
         """
     )
+    # Serialize schema verification/migration so concurrent bootstrap calls
+    # cannot both observe a missing migration row and race on INSERT/ALTER.
+    conn.execute("BEGIN IMMEDIATE")
+    existing_search_columns = {row[1] for row in conn.execute("PRAGMA table_info(search_log)").fetchall()}
+    for column, definition in {
+        "provider": "TEXT NOT NULL DEFAULT ''",
+        "attempt_count": "INTEGER NOT NULL DEFAULT 0",
+        "query_key": "TEXT NOT NULL DEFAULT ''",
+        "technical_error": "TEXT",
+    }.items():
+        if column not in existing_search_columns:
+            conn.execute(f"ALTER TABLE search_log ADD COLUMN {column} {definition}")
+    existing_evidence_columns = {row[1] for row in conn.execute("PRAGMA table_info(evidence)").fetchall()}
+    for column, definition in {
+        "source_class": "TEXT NOT NULL DEFAULT 'search_snippet'",
+        "authority_reason": "TEXT NOT NULL DEFAULT 'unknown_origin_fail_closed'",
+        "parent_search_id": "TEXT NOT NULL DEFAULT ''",
+    }.items():
+        if column not in existing_evidence_columns:
+            conn.execute(f"ALTER TABLE evidence ADD COLUMN {column} {definition}")
     existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(run_state)").fetchall()}
     for column, definition in {
         "max_tasks": "INTEGER NOT NULL DEFAULT 50",
@@ -324,27 +474,50 @@ def _connect(run_id: str) -> sqlite3.Connection:
         "retry_reason": "TEXT",
         "retry_count": "INTEGER NOT NULL DEFAULT 0",
         "resume_count": "INTEGER NOT NULL DEFAULT 0",
+        "execution_generation": "INTEGER NOT NULL DEFAULT 0",
+        "graph_revision": "TEXT NOT NULL DEFAULT ''",
+        "last_stop_reason": "TEXT",
+        "checkpoint_reason": "TEXT",
+        "terminal_reason": "TEXT",
     }.items():
         if column not in existing_columns:
             conn.execute(f"ALTER TABLE run_state ADD COLUMN {column} {definition}")
     migration = conn.execute("SELECT migration_id FROM schema_migrations WHERE migration_id='corporate-intelligence-graph-v1-to-v2'").fetchone()
     if migration is None:
         from_version = "corporate-intelligence-graph/v1" if preexisting_db else "bootstrap"
-        required_tables = {"run_state", "nodes", "edges", "evidence", "frontier", "frontier_tasks", "run_events", "report_artifacts", "reasoning_decisions", "report_reviews"}
+        required_tables = {"run_state", "nodes", "edges", "evidence", "frontier", "frontier_tasks", "search_log", "search_provider_circuits", "run_events", "convergence_snapshots", "report_artifacts", "report_drafts", "reasoning_decisions", "report_reviews"}
         present_tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
         missing_tables = sorted(required_tables - present_tables)
         if missing_tables:
             raise RuntimeError(f"schema v2 migration incomplete; missing tables: {', '.join(missing_tables)}")
         conn.execute(
-            "INSERT INTO schema_migrations(migration_id,from_version,to_version,applied_at,integrity_json) VALUES(?,?,?,?,?)",
+            "INSERT OR IGNORE INTO schema_migrations(migration_id,from_version,to_version,applied_at,integrity_json) VALUES(?,?,?,?,?)",
             ("corporate-intelligence-graph-v1-to-v2", from_version, SCHEMA_VERSION, _now(), _json({"required_tables": sorted(required_tables), "missing_tables": missing_tables})),
         )
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations(migration_id,from_version,to_version,applied_at,integrity_json) VALUES(?,?,?,?,?)",
+        ("corporate-intelligence-evidence-contract-v1", SCHEMA_VERSION, SCHEMA_VERSION, _now(), _json({"historical_rows_preserved": True, "new_columns": ["source_class", "authority_reason", "parent_search_id"], "findings_table": True})),
+    )
     conn.commit()
     return conn
 
 
 def _json(value) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _report_content_revision(graph: dict) -> str:
+    """Hash graph content, excluding mutable lifecycle/status fields."""
+    content = {
+        key: graph.get(key)
+        for key in (
+            "schema_version", "target", "nodes", "edges", "evidence",
+            "frontier", "frontier_tasks", "search_log",
+            "identity_candidates", "identity_resolution", "findings",
+            "legal_identity_exhaustion", "inventory",
+        )
+    }
+    return hashlib.sha256(_json(content).encode("utf-8")).hexdigest()
 
 
 def _materialize(conn: sqlite3.Connection, run_id: str) -> None:
@@ -355,12 +528,16 @@ def _materialize(conn: sqlite3.Connection, run_id: str) -> None:
     frontier = [dict(row) for row in conn.execute("SELECT * FROM frontier ORDER BY priority DESC,node_id")]
     frontier_tasks = [dict(row) for row in conn.execute("SELECT * FROM frontier_tasks ORDER BY priority DESC,created_at ASC,task_id")]
     search_log = [dict(row) for row in conn.execute("SELECT * FROM search_log ORDER BY search_id")]
+    search_provider_circuits = [dict(row) for row in conn.execute("SELECT * FROM search_provider_circuits WHERE run_id=? ORDER BY provider", (run_id,))]
     identity_candidates = [dict(row) for row in conn.execute("SELECT * FROM identity_candidates WHERE run_id=? ORDER BY score DESC,updated_at DESC", (run_id,))]
+    findings = [dict(row) for row in conn.execute("SELECT * FROM findings WHERE run_id=? ORDER BY updated_at DESC,finding_id", (run_id,))]
     worker_checkpoints = [dict(row) for row in conn.execute("SELECT * FROM worker_checkpoints WHERE run_id=? ORDER BY updated_at DESC,checkpoint_id DESC", (run_id,))]
+    draft_row = conn.execute("SELECT graph_revision,model,provider,stage,generated_at,updated_at FROM report_drafts WHERE run_id=? ORDER BY updated_at DESC LIMIT 1", (run_id,)).fetchone()
+    report_state = dict(draft_row) if draft_row else {"stage": "REPORT_PENDING"}
     for row in frontier_tasks:
         row.pop("lease_token", None)
-    for row in nodes + edges + evidence + frontier + search_log + identity_candidates:
-        for key in ("evidence_ids", "discovered_from", "planned_pivots", "new_node_ids", "matching_dimensions", "conflicting_dimensions", "missing_dimensions"):
+    for row in nodes + edges + evidence + frontier + search_log + identity_candidates + findings:
+        for key in ("evidence_ids", "discovered_from", "planned_pivots", "new_node_ids", "matching_dimensions", "conflicting_dimensions", "missing_dimensions", "subject_node_ids", "supporting_evidence_ids"):
             if key in row and isinstance(row[key], str):
                 row[key] = json.loads(row[key])
     for row in worker_checkpoints:
@@ -368,62 +545,230 @@ def _materialize(conn: sqlite3.Connection, run_id: str) -> None:
         if isinstance(row.get("cursor_json"), str):
             row["cursor"] = json.loads(row.pop("cursor_json"))
     open_frontier = sum(row["state"] == "OPEN" for row in frontier)
-    graph = {
+    node_breakdown = dict(sorted(Counter(row["node_type"] for row in nodes).items()))
+    convergence_row = conn.execute(
+        "SELECT * FROM convergence_snapshots WHERE run_id=? ORDER BY snapshot_id DESC LIMIT 1",
+        (run_id,),
+    ).fetchone()
+    convergence = dict(convergence_row) if convergence_row else None
+    if convergence:
+        convergence.pop("snapshot_id", None)
+        convergence.pop("run_id", None)
+    finding_nodes = node_breakdown.get("finding", 0)
+    candidate_nodes = sum(node_breakdown.get(node_type, 0) for node_type in ("legal_entity_candidate", "organization_candidate"))
+    generation = int(run["execution_generation"] or 0)
+    base_graph = {
         "schema_version": SCHEMA_VERSION,
         "target": {"url": run["target_url"], "domain": _domain(run["target_url"])},
         "research_state": {
             "status": run["status"], "round": run["round"], "frontier_open": open_frontier,
+            "runtime_status": run["status"],
             "stale_rounds": 0,
             "budgets": {"max_rounds": 8, "max_tasks": run["max_tasks"], "max_searches": run["max_searches"], "max_nodes": run["max_nodes"], "max_edges": run["max_edges"], "deadline_at": run["deadline_at"]},
             "usage": {"tasks_executed": run["tasks_executed"], "source_calls": run["source_calls"]},
             "saturation_reason": run["saturation_reason"],
+            "last_stop_reason": run["last_stop_reason"],
+            "checkpoint_reason": run["checkpoint_reason"],
+            "terminal_reason": run["terminal_reason"],
+            "execution_generation": generation,
+            "resume_generation": generation,
             "retry_at": run["retry_at"], "retry_reason": run["retry_reason"], "retry_count": run["retry_count"], "resume_count": run["resume_count"],
+            "report": report_state,
         },
         "identity_resolution": {"status": "AMBIGUOUS", "candidate_ids": [row["candidate_id"] for row in identity_candidates]},
         "identity_candidates": identity_candidates,
+        "findings": findings,
         "worker_checkpoints": worker_checkpoints,
         "nodes": nodes, "edges": edges, "evidence": evidence,
-        "frontier": frontier, "frontier_tasks": frontier_tasks, "search_log": search_log,
+        "frontier": frontier, "frontier_tasks": frontier_tasks, "search_log": search_log, "search_provider_circuits": search_provider_circuits,
         "pivot_coverage": {},
         "legal_identity_exhaustion": {"status": run["legal_identity_status"], "reason": run["legal_identity_reason"], "checked_at": run["legal_identity_checked_at"], "coverage": json.loads(run["legal_identity_coverage"] or "{}")},
+        "counts": {
+            "graph_nodes": len(nodes), "graph_edges": len(edges), "evidence": len(evidence),
+            "frontier": len(frontier), "frontier_open": open_frontier,
+            "finding_nodes": finding_nodes, "candidate_nodes": candidate_nodes,
+            "identity_candidates": len(identity_candidates),
+        },
+        "node_breakdown": node_breakdown,
+        "planner": {
+            "mode": "identity_resolution" if str(run["checkpoint_reason"] or "").startswith("legal_identity_exhaustion_pending") else "exploration",
+            "reason": run["checkpoint_reason"],
+            "identity_focused_pivots": sorted(_IDENTITY_FOCUSED_PIVOTS),
+            "max_pivots_per_node": _MAX_PIVOTS_PER_NODE,
+            "max_open_frontier_tasks_per_run": _MAX_OPEN_FRONTIER_TASKS_PER_RUN,
+        },
+        "convergence": convergence,
     }
     inventory_path = _run_dir(run_id) / "inventory.json"
     if inventory_path.exists():
         try:
-            graph["inventory"] = json.loads(inventory_path.read_text(encoding="utf-8"))
+            base_graph["inventory"] = json.loads(inventory_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            graph["inventory"] = {"error": "inventory_projection_unavailable"}
+            base_graph["inventory"] = {"error": "inventory_projection_unavailable"}
+    validate_graph(base_graph)
+    graph_revision = hashlib.sha256(_json(base_graph).encode("utf-8")).hexdigest()
+    graph = {
+        **base_graph,
+        "graph_revision": graph_revision,
+        "updated_at": run["updated_at"],
+        "projection_source": "durable",
+        "execution_generation": generation,
+        "resume_generation": generation,
+    }
     validate_graph(graph)
     run_dir = _run_dir(run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
     _atomic_json(run_dir / "graph.json", graph)
-    for name, rows in (("nodes.jsonl", nodes), ("edges.jsonl", edges), ("evidence.jsonl", evidence), ("frontier_tasks.jsonl", frontier_tasks), ("search_log.jsonl", search_log), ("identity_candidates.jsonl", identity_candidates), ("worker_checkpoints.jsonl", worker_checkpoints)):
+    for name, rows in (("nodes.jsonl", nodes), ("edges.jsonl", edges), ("evidence.jsonl", evidence), ("findings.jsonl", findings), ("frontier_tasks.jsonl", frontier_tasks), ("search_log.jsonl", search_log), ("identity_candidates.jsonl", identity_candidates), ("worker_checkpoints.jsonl", worker_checkpoints)):
         _atomic_text(run_dir / name, "".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in rows))
+    conn.execute("UPDATE run_state SET graph_revision=? WHERE run_id=?", (graph_revision, run_id))
+    conn.commit()
+
+
+class CompanyIntelArtifactPublicationError(RuntimeError):
+    def __init__(self, root: Path, relative_path: Path, error: ArtifactFailure):
+        parts = relative_path.parts
+        artifact_class = classify_artifact(relative_path).artifact_class
+        event = {
+            "code": "ARTIFACT_ACCESS_POSTCONDITION_FAILED",
+            "run_id": parts[1] if len(parts) > 1 and parts[0] == "runs" else "",
+            "artifact_class": artifact_class.name if artifact_class else "unknown",
+            "relative_path": relative_path.as_posix(),
+            "reason_code": error.reason_code,
+        }
+        self.event = event
+        super().__init__(json.dumps(event, sort_keys=True))
+
+
+def _canonical_artifact_path(path: Path) -> tuple[Path, Path] | None:
+    lexical_root = _home() / "companyintel"
+    root = lexical_root.resolve()
+    try:
+        # Preserve the lexical destination so the canonical contract can
+        # reject symlink components instead of resolving through them.
+        relative = path.relative_to(lexical_root)
+    except ValueError:
+        return None
+    decision = classify_artifact(relative)
+    if decision.artifact_class is None:
+        return None
+    return root, relative
 
 
 def _atomic_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp, path)
-    finally:
-        if os.path.exists(temp):
-            os.unlink(temp)
+    canonical = _canonical_artifact_path(path)
+    if canonical is not None:
+        root, relative = canonical
+        try:
+            publish_text(
+                root,
+                relative,
+                content,
+                reader_principal=DEFAULT_READER_PRINCIPAL,
+                apply_acl=True,
+            )
+        except ArtifactFailure as exc:
+            raise CompanyIntelArtifactPublicationError(root, relative, exc) from exc
+        return
+    raise RuntimeError("unapproved CompanyIntel text publication path")
 
 
 def _atomic_json(path: Path, value: dict) -> None:
     _atomic_text(path, json.dumps(value, ensure_ascii=False, indent=2) + "\n")
 
 
+def _record_convergence_snapshot(conn: sqlite3.Connection, run_id: str, reason: str, created_at: str) -> None:
+    run = conn.execute(
+        "SELECT execution_generation,tasks_executed FROM run_state WHERE run_id=?",
+        (run_id,),
+    ).fetchone()
+    if run is None:
+        return
+    generation = int(run["execution_generation"] or 0)
+    current = {
+        "tasks_attempted": int(run["tasks_executed"] or 0),
+        "tasks_completed": int(conn.execute(
+            "SELECT COUNT(*) FROM frontier_tasks WHERE run_id=? AND state IN ('COMPLETED','FAILED','BLOCKED_CAPABILITY','SKIPPED_UNSUPPORTED','SKIPPED_BREADTH_CAP','SKIPPED_IDENTITY_FOCUS','SKIPPED_REDUNDANT','SKIPPED_PROVIDER_BLOCKED','SKIPPED_DEDUPLICATED')",
+            (run_id,),
+        ).fetchone()[0]),
+        "nodes": int(conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]),
+        "typed_entities": int(conn.execute(
+            "SELECT COUNT(*) FROM nodes WHERE node_type NOT IN ('finding','domain','url')"
+        ).fetchone()[0]),
+        "findings": int(conn.execute("SELECT COUNT(*) FROM nodes WHERE node_type='finding'").fetchone()[0]),
+        "evidence": int(conn.execute("SELECT COUNT(*) FROM evidence").fetchone()[0]),
+        "identity_candidates": int(conn.execute("SELECT COUNT(*) FROM identity_candidates WHERE run_id=?", (run_id,)).fetchone()[0]),
+        "verified_edges": int(conn.execute("SELECT COUNT(*) FROM edges WHERE confidence >= 0.8").fetchone()[0]),
+        "frontier_tasks": int(conn.execute("SELECT COUNT(*) FROM frontier_tasks WHERE run_id=?", (run_id,)).fetchone()[0]),
+    }
+    previous = conn.execute(
+        "SELECT * FROM convergence_snapshots WHERE run_id=? AND execution_generation=? ORDER BY snapshot_id DESC LIMIT 1",
+        (run_id, generation),
+    ).fetchone()
+    baseline = {
+        "tasks_attempted": int(previous["tasks_attempted"] if previous else 0),
+        "tasks_completed": int(previous["tasks_completed"] if previous else 0),
+        "nodes": int(previous["nodes_total"] if previous else 0),
+        "typed_entities": int(previous["typed_entities_total"] if previous else 0),
+        "findings": int(previous["findings_total"] if previous else 0),
+        "evidence": int(previous["evidence_total"] if previous else 0),
+        "identity_candidates": int(previous["identity_candidates_total"] if previous else 0),
+        "verified_edges": int(previous["verified_edges_total"] if previous else 0),
+        "frontier_tasks": int(previous["frontier_tasks_total"] if previous else 0),
+    }
+    deltas = {
+        "tasks_attempted": max(0, current["tasks_attempted"] - baseline["tasks_attempted"]),
+        "tasks_completed": max(0, current["tasks_completed"] - baseline["tasks_completed"]),
+        "new_nodes": max(0, current["nodes"] - baseline["nodes"]),
+        "new_typed_entities": max(0, current["typed_entities"] - baseline["typed_entities"]),
+        "new_findings": max(0, current["findings"] - baseline["findings"]),
+        "new_evidence": max(0, current["evidence"] - baseline["evidence"]),
+        "new_identity_candidates": max(0, current["identity_candidates"] - baseline["identity_candidates"]),
+        "new_verified_edges": max(0, current["verified_edges"] - baseline["verified_edges"]),
+        "frontier_spawned": max(0, current["frontier_tasks"] - baseline["frontier_tasks"]),
+    }
+    task_count = deltas["tasks_attempted"]
+    completed_count = deltas["tasks_completed"]
+    evidence_gain_per_task = deltas["new_evidence"] / task_count if task_count else 0.0
+    candidate_gain_per_task = deltas["new_identity_candidates"] / task_count if task_count else 0.0
+    frontier_spawn_ratio = deltas["frontier_spawned"] / completed_count if completed_count else 0.0
+    low_information_gain = int(
+        task_count >= 4
+        and deltas["new_evidence"] == 0
+        and deltas["new_identity_candidates"] == 0
+        and frontier_spawn_ratio >= 1.0
+    )
+    conn.execute(
+        """INSERT INTO convergence_snapshots(
+            run_id,execution_generation,reason,tasks_attempted,tasks_completed,
+            new_nodes,new_typed_entities,new_findings,new_evidence,new_identity_candidates,
+            new_verified_edges,frontier_spawned,nodes_total,typed_entities_total,
+            findings_total,evidence_total,identity_candidates_total,verified_edges_total,
+            frontier_tasks_total,evidence_gain_per_task,candidate_gain_per_task,
+            frontier_spawn_ratio,low_information_gain,created_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            run_id, generation, reason, deltas["tasks_attempted"], deltas["tasks_completed"],
+            deltas["new_nodes"], deltas["new_typed_entities"], deltas["new_findings"],
+            deltas["new_evidence"], deltas["new_identity_candidates"], deltas["new_verified_edges"],
+            deltas["frontier_spawned"], current["nodes"], current["typed_entities"],
+            current["findings"], current["evidence"], current["identity_candidates"],
+            current["verified_edges"], current["frontier_tasks"], evidence_gain_per_task,
+            candidate_gain_per_task, frontier_spawn_ratio, low_information_gain, created_at,
+        ),
+    )
+
+
 def _checkpoint(conn: sqlite3.Connection, run_id: str, reason: str) -> None:
+    created_at = _now()
+    conn.execute("UPDATE run_state SET checkpoint_reason=?,updated_at=? WHERE run_id=?", (reason, created_at, run_id))
+    _record_convergence_snapshot(conn, run_id, reason, created_at)
+    conn.commit()
+    _materialize(conn, run_id)
     graph_path = _run_dir(run_id) / "graph.json"
     graph_json = graph_path.read_bytes() if graph_path.exists() else b""
     digest = hashlib.sha256(graph_json).hexdigest()
-    created_at = _now()
     conn.execute("INSERT INTO checkpoints(created_at,reason,graph_digest) VALUES(?,?,?)", (created_at, reason, digest))
     conn.commit()
     _atomic_json(_run_dir(run_id) / "checkpoints" / "latest.json", {
@@ -468,23 +813,68 @@ def _latest_worker_checkpoint(conn: sqlite3.Connection, run_id: str, task_id: st
     ).fetchone()
 
 
+def _planner_policy(conn: sqlite3.Connection, run_id: str) -> dict:
+    run = conn.execute(
+        "SELECT checkpoint_reason FROM run_state WHERE run_id=?",
+        (run_id,),
+    ).fetchone()
+    candidate_count = int(conn.execute(
+        "SELECT COUNT(*) FROM identity_candidates WHERE run_id=? AND status <> 'REJECTED'",
+        (run_id,),
+    ).fetchone()[0])
+    latest = conn.execute(
+        "SELECT low_information_gain FROM convergence_snapshots WHERE run_id=? ORDER BY snapshot_id DESC LIMIT 1",
+        (run_id,),
+    ).fetchone()
+    checkpoint_reason = str(run["checkpoint_reason"] or "") if run else ""
+    identity_focus = checkpoint_reason.startswith("legal_identity_exhaustion_pending") and candidate_count == 0
+    low_gain = bool(latest and latest["low_information_gain"])
+    return {
+        "mode": "identity_resolution" if identity_focus or low_gain else "exploration",
+        "identity_focus": identity_focus or low_gain,
+        "reason": "legal_identity_exhaustion_pending" if identity_focus else "LOW_INFORMATION_GAIN" if low_gain else None,
+    }
+
+
 def _enqueue_frontier_tasks(conn: sqlite3.Connection, run_id: str, node_id: str, priority: int, planned_pivots: list[str]) -> int:
     from tools.companyintel_pivots import get_pivot
     now = time.time()
-    inserted = 0
-    for pivot_type in sorted({str(value).strip() for value in planned_pivots if str(value).strip()}):
-        task_id = _stable_id("frontier-task", run_id, node_id, pivot_type)
+    policy = _planner_policy(conn, run_id)
+    existing_open = int(conn.execute(
+        "SELECT COUNT(*) FROM frontier_tasks WHERE run_id=? AND state IN ('OPEN','CLAIMED','RETRY_WAIT')",
+        (run_id,),
+    ).fetchone()[0])
+    specs = []
+    for pivot_type in {str(value).strip() for value in planned_pivots if str(value).strip()}:
         spec = get_pivot(pivot_type)
-        initial_state = "OPEN" if spec is not None and spec.implemented else "SKIPPED_UNSUPPORTED"
-        initial_error = None if initial_state == "OPEN" else "typed_worker_not_implemented"
+        spec_priority = spec.priority if spec is not None else 0
+        specs.append((spec_priority, pivot_type, spec))
+    specs.sort(key=lambda item: (-item[0], item[1]))
+    inserted = 0
+    for index, (_, pivot_type, spec) in enumerate(specs):
+        task_id = _stable_id("frontier-task", run_id, node_id, pivot_type)
+        if index >= _MAX_PIVOTS_PER_NODE:
+            initial_state = "SKIPPED_BREADTH_CAP"
+            initial_error = "breadth_cap_per_node"
+        elif policy["identity_focus"] and pivot_type not in _IDENTITY_FOCUSED_PIVOTS:
+            initial_state = "SKIPPED_IDENTITY_FOCUS"
+            initial_error = "identity_resolution_focus"
+        elif existing_open >= _MAX_OPEN_FRONTIER_TASKS_PER_RUN:
+            initial_state = "SKIPPED_BREADTH_CAP"
+            initial_error = "breadth_cap_per_run"
+        else:
+            initial_state = "OPEN" if spec is not None and spec.implemented else "BLOCKED_CAPABILITY"
+            initial_error = None if initial_state == "OPEN" else f"CAPABILITY_UNAVAILABLE:capability={pivot_type};reason=worker_not_installed"
         cursor = conn.execute(
             """INSERT OR IGNORE INTO frontier_tasks(
                 task_id,run_id,node_id,pivot_type,priority,state,attempt,max_attempts,
                 available_at,last_error,created_at,updated_at
             ) VALUES(?,?,?,?,?, ?,0,3,?,?,?,?)""",
-            (task_id, run_id, node_id, pivot_type, int(priority), initial_state, now, initial_error, now, now),
+            (task_id, run_id, node_id, pivot_type, max(int(priority), int(spec.priority if spec else 0)), initial_state, now, initial_error, now, now),
         )
         inserted += cursor.rowcount
+        if initial_state == "OPEN":
+            existing_open += cursor.rowcount
     return inserted
 
 
@@ -668,10 +1058,20 @@ def _lease_mutation(args: dict, action: str) -> dict:
             lease_seconds = min(3600.0, max(1.0, float(args.get("lease_seconds", 300))))
             conn.execute("UPDATE frontier_tasks SET lease_expires_at=?,updated_at=? WHERE task_id=?", (now + lease_seconds, now, task_id))
             state = "CLAIMED"
+        elif action == "skip":
+            state = str(args.get("skip_state", "SKIPPED_PROVIDER_BLOCKED")).strip()
+            if state not in {"SKIPPED_PROVIDER_BLOCKED", "SKIPPED_DEDUPLICATED", "SKIPPED_REDUNDANT"}:
+                raise ValueError("unsupported frontier skip state")
+            error = " ".join(str(args.get("error", state)).split())[:500]
+            conn.execute(
+                "UPDATE frontier_tasks SET state=?,worker_id=NULL,lease_token=NULL,lease_expires_at=NULL,last_error=?,updated_at=? WHERE task_id=?",
+                (state, error, now, task_id),
+            )
         else:
             error = " ".join(str(args.get("error", "frontier task failed")).split())[:500]
             retry_after = min(3600.0, max(0.0, float(args.get("retry_after_seconds", 30))))
-            if row["attempt"] < row["max_attempts"]:
+            retryable = args.get("retryable", True) is not False
+            if retryable and row["attempt"] < row["max_attempts"]:
                 state = "RETRY_WAIT"
                 conn.execute("UPDATE frontier_tasks SET state=?,available_at=?,worker_id=NULL,lease_token=NULL,lease_expires_at=NULL,last_error=?,updated_at=? WHERE task_id=?", (state, now + retry_after, error, now, task_id))
             else:
@@ -782,6 +1182,23 @@ def _frontier_status(args: dict) -> dict:
 
 
 def _init_run(args: dict) -> dict:
+    if args.get("preflight"):
+        from tools.companyintel_public_search import provider_readiness
+        readiness = provider_readiness()
+        if not readiness.get("ready"):
+            return {
+                "ok": False,
+                "code": "COMPANYINTEL_SEARCH_PROVIDER_UNAVAILABLE",
+                "stage": "preflight",
+                "retryable": False,
+                "error": "CompanyIntel preflight failed: no ready allowlisted search provider",
+                "error_detail": {
+                    "code": "COMPANYINTEL_SEARCH_PROVIDER_UNAVAILABLE",
+                    "stage": "preflight",
+                    "retryable": False,
+                    "provider_readiness": readiness,
+                },
+            }
     run_id = args.get("run_id", "")
     if not _RUN_ID_RE.fullmatch(run_id):
         raise ValueError("run_id is required and must be safe")
@@ -792,7 +1209,7 @@ def _init_run(args: dict) -> dict:
     max_edges = min(10000, max(1, int(args.get("max_edges", 500))))
     deadline_seconds = min(86400.0, max(60.0, float(args.get("deadline_seconds", 3600))))
     deadline_at = time.time() + deadline_seconds
-    conn = _connect(run_id)
+    conn = _connect(run_id, create=True)
     now = _now()
     with conn:
         conn.execute("INSERT OR REPLACE INTO run_state(run_id,target_url,status,round,created_at,updated_at,max_tasks,max_searches,max_nodes,max_edges,deadline_at,tasks_executed,source_calls,saturation_reason) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (run_id, target_url, "RUNNING", 0, now, now, max_tasks, max_searches, max_nodes, max_edges, deadline_at, 0, 0, None))
@@ -805,11 +1222,18 @@ def _init_run(args: dict) -> dict:
         priority = max(spec.priority for spec in planned_specs)
         conn.execute("INSERT OR REPLACE INTO frontier(node_id,priority,reason,planned_pivots,state) VALUES(?,?,?,?,?)", (node_id, priority, "seed domain inventory", _json(planned_pivots), "OPEN"))
         _enqueue_frontier_tasks(conn, run_id, node_id, priority, planned_pivots)
-        start_event = _append_event_conn(conn, run_id, "run.started", {"target_url": target_url, "status": "RUNNING"}, "run.started")
+        start_event = _append_event_conn(
+            conn, run_id, "run.started",
+            {"target_url": target_url, "status": "RUNNING", "execution_generation": 0, "resume_generation": 0},
+            "run.started",
+        )
     _materialize(conn, run_id)
     _checkpoint(conn, run_id, "run_initialized")
     conn.close()
-    return {"ok": True, "run_id": run_id, "status": "RUNNING", "seed_node_id": node_id, "event": start_event}
+    return {
+        "ok": True, "run_id": run_id, "status": "RUNNING", "seed_node_id": node_id,
+        "execution_generation": 0, "resume_generation": 0, "event": start_event,
+    }
 
 
 def _inventory(args: dict) -> dict:
@@ -847,9 +1271,13 @@ def _inventory(args: dict) -> dict:
             "relation": "inventory_discovered",
             "retrieval_method": "bounded_http_inventory",
             "access_status": "success",
+            # Inventory is discovery-only; URL verification is admitted only
+            # for URLs that came from a persisted public-search result.
+            "enqueue_pivots": False,
         })
         if result.get("ok"):
             persisted += 1
+    _promote_inventory_identity(run_id, initialized["seed_node_id"], inventory)
     return {
         "ok": True,
         "run_id": run_id,
@@ -861,7 +1289,187 @@ def _inventory(args: dict) -> dict:
     }
 
 
+def _promote_inventory_identity(run_id: str, seed_node_id: str, inventory: dict) -> None:
+    """Promote only code-owned first-party observations into graph facts."""
+    conn = _connect(run_id)
+    try:
+        evidence_rows = conn.execute(
+            "SELECT evidence_id FROM evidence WHERE source_tier IN ('A','B') "
+            "AND access_status IN ('success','challenge') ORDER BY retrieved_at,evidence_id"
+        ).fetchall()
+        if not evidence_rows:
+            return
+        evidence_ids = [row["evidence_id"] for row in evidence_rows[:12]]
+        target = conn.execute("SELECT target_url FROM run_state WHERE run_id=?", (run_id,)).fetchone()
+        if target is None:
+            return
+        domain = _domain(str(target["target_url"]))
+        now = _now()
+        finding_id = _stable_id("finding", run_id, "first_party_web_presence", domain)
+        subject_ids = [seed_node_id]
+        conn.execute(
+            "INSERT OR REPLACE INTO findings(finding_id,run_id,finding_type,subject_node_ids,"
+            "supporting_evidence_ids,confidence,status,rule_version,contradiction_group,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (finding_id, run_id, "first_party_web_presence", _json(subject_ids),
+             _json(evidence_ids), 0.65, "OBSERVED", "companyintel-finding-v1", "", now, now),
+        )
+        node_id = _stable_id("finding", finding_id)
+        conn.execute(
+            "INSERT OR IGNORE INTO nodes(node_id,node_type,value,normalized_value,status,confidence,"
+            "evidence_ids,discovered_from,first_seen_round,frontier_state) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (node_id, "finding", f"first_party_web_presence:{domain}",
+             f"first_party_web_presence:{domain}", "OBSERVED", 0.65,
+             _json(evidence_ids), _json(subject_ids), 0, "CLOSED"),
+        )
+        metadata = inventory.get("metadata") if isinstance(inventory.get("metadata"), dict) else {}
+        legal_name = " ".join(str(metadata.get("title") or "").split())[:240]
+        if legal_name and len(legal_name) >= 2:
+            candidate_id = _stable_id("candidate", run_id, "first_party_title", legal_name.lower())
+            conn.execute(
+                "INSERT OR REPLACE INTO identity_candidates(candidate_id,run_id,legal_name,legal_id,country,score,status,"
+                "matching_dimensions,conflicting_dimensions,missing_dimensions,evidence_ids,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (candidate_id, run_id, legal_name, "", "", 40, "AMBIGUOUS",
+                 _json(["name_only"]), _json([]), _json(["legal_id", "country", "official_registry"]),
+                 _json(evidence_ids), now, now),
+            )
+        conn.execute("UPDATE run_state SET updated_at=? WHERE run_id=?", (now, run_id))
+        conn.commit()
+        _materialize(conn, run_id)
+        _checkpoint(conn, run_id, "code_owned_identity_promotion")
+    finally:
+        conn.close()
+
+
+def _execute_document_extraction_frontier(args: dict) -> dict:
+    """Verify one previously discovered URL with bounded SSRF-safe extraction."""
+    run_id = args.get("run_id", "")
+    worker_id = str(args.get("worker_id", "")).strip()
+    claimed = _claim_frontier({**args, "pivot_type": "document_extraction"})
+    task = claimed.get("task")
+    if task is None:
+        return {"ok": True, "outcome": "NO_TASK", "pivot_type": "document_extraction", "persisted_results": 0}
+    conn = _connect(run_id)
+    row = conn.execute(
+        "SELECT n.node_type,n.value,r.target_url FROM nodes n JOIN run_state r ON r.run_id=? WHERE n.node_id=?",
+        (run_id, task["node_id"]),
+    ).fetchone()
+    conn.close()
+    if row is None:
+        failure = _lease_mutation({**args, "task_id": task["task_id"], "worker_id": worker_id,
+                                   "lease_token": task["lease_token"], "error": "pivot node not found"}, "fail")
+        return {"ok": False, "outcome": "FAILED", "pivot_type": "document_extraction", "state": failure["state"], "persisted_results": 0}
+    # Verification is only admitted for URLs persisted as search results.
+    # Inventory-discovered URLs remain discovery data until a search result
+    # creates the explicit parent_search_id provenance edge.
+    provenance = _connect(run_id)
+    try:
+        node = provenance.execute("SELECT evidence_ids FROM nodes WHERE node_id=?", (task["node_id"],)).fetchone()
+        evidence_ids = json.loads(node["evidence_ids"] or "[]") if node else []
+        allowed = False
+        for evidence_id in evidence_ids:
+            source = provenance.execute(
+                "SELECT parent_search_id FROM evidence WHERE evidence_id=? AND access_status IN ('success','challenge')",
+                (evidence_id,),
+            ).fetchone()
+            if source and source["parent_search_id"]:
+                search = provenance.execute(
+                    "SELECT status FROM search_log WHERE search_id=?", (source["parent_search_id"],)
+                ).fetchone()
+                if search and search["status"] in {"COMPLETED_WITH_RESULTS", "COMPLETED_ZERO_RESULTS"}:
+                    allowed = True
+                    break
+    finally:
+        provenance.close()
+    if not allowed:
+        error = "CAPABILITY_UNAVAILABLE:capability=document_extraction;reason=requires_persisted_search_result"
+        failure = _lease_mutation({**args, "task_id": task["task_id"], "worker_id": worker_id,
+                                   "lease_token": task["lease_token"], "error": error, "retryable": False}, "fail")
+        return {"ok": True, "outcome": "BLOCKED_CAPABILITY", "pivot_type": "document_extraction",
+                "task_id": task["task_id"], "state": failure["state"], "persisted_results": 0, "error": error}
+    try:
+        extracted = extract_url(
+            row["value"], target_url=row["target_url"],
+            limits=ExtractionLimits(
+                timeout_seconds=min(10.0, max(1.0, float(args.get("search_timeout_seconds", 8.0)))),
+                max_bytes=min(512 * 1024, max(16 * 1024, int(args.get("max_bytes_per_url", 512 * 1024)))),
+                max_redirects=3,
+            ),
+        )
+        requested_tier = "C" if extracted.get("access_status") == "challenge" else extracted.get("source_tier", "C")
+        observation = _record_observation({
+            "run_id": run_id,
+            "node_type": row["node_type"] if row["node_type"] in {"url", "document"} else "url",
+            "value": extracted["source_url"],
+            "source_url": extracted["source_url"],
+            "source_title": extracted.get("source_title", ""),
+            "excerpt": extracted.get("excerpt", "") or "bounded document extraction completed",
+            "retrieval_method": extracted.get("retrieval_method", "bounded_http_extraction"),
+            "source_tier": requested_tier,
+            "content_type": extracted.get("content_type", ""),
+            "content_sha256": extracted.get("content_sha256", ""),
+            "access_status": extracted.get("access_status", "success"),
+        })
+        # Promote only narrowly typed JSON-LD fields; arbitrary page text is
+        # never interpreted as a legal identifier by this worker.
+        structured_name = ""
+        for item in extracted.get("jsonld", [])[:10]:
+            if not isinstance(item, dict):
+                continue
+            if not structured_name:
+                structured_name = str(item.get("legalName") or item.get("name") or "").strip()[:240]
+            typed_values = (("telephone", "phone"), ("email", "email"), ("address", "address"))
+            for field, node_type in typed_values:
+                value = item.get(field)
+                if isinstance(value, dict):
+                    value = value.get("streetAddress") or value.get("name") or ""
+                if isinstance(value, str) and value.strip():
+                    try:
+                        _record_observation({
+                            "run_id": run_id, "node_type": node_type, "value": value,
+                            "source_url": extracted["source_url"],
+                            "excerpt": f"JSON-LD {field}: {value}",
+                            "retrieval_method": "bounded_http_extraction",
+                            "source_tier": requested_tier, "content_type": extracted.get("content_type", ""),
+                            "content_sha256": extracted.get("content_sha256", ""),
+                            "access_status": extracted.get("access_status", "success"),
+                        })
+                    except ValueError:
+                        continue
+        if structured_name:
+            conn = _connect(run_id)
+            target_row = conn.execute("SELECT target_url FROM run_state WHERE run_id=?", (run_id,)).fetchone()
+            conn.close()
+            if target_row:
+                _promote_inventory_identity(run_id, _stable_id("domain", _domain(target_row["target_url"])), {"metadata": {"title": structured_name}})
+        completed = _lease_mutation({**args, "task_id": task["task_id"], "worker_id": worker_id,
+                                     "lease_token": task["lease_token"]}, "complete")
+        return {"ok": True, "outcome": "COMPLETED_WITH_RESULTS", "pivot_type": "document_extraction",
+                "task_id": task["task_id"], "state": completed["state"],
+                "persisted_results": 1 if observation.get("ok") else 0,
+                "source_tier": observation.get("source_tier", "C")}
+    except ExtractionError as exc:
+        failure = _lease_mutation({**args, "task_id": task["task_id"], "worker_id": worker_id,
+                                   "lease_token": task["lease_token"], "error": exc.code,
+                                   "retryable": bool(exc.retryable)}, "fail")
+        return {"ok": True, "outcome": "RETRYABLE_ERROR" if exc.retryable else "FAILED",
+                "pivot_type": "document_extraction", "task_id": task["task_id"],
+                "state": failure["state"], "persisted_results": 0, "error": exc.code}
+    except Exception:
+        failure = _lease_mutation({**args, "task_id": task["task_id"], "worker_id": worker_id,
+                                   "lease_token": task["lease_token"], "error": "extraction_failed"}, "fail")
+        return {"ok": True, "outcome": "FAILED", "pivot_type": "document_extraction", "task_id": task["task_id"],
+                "state": failure["state"], "persisted_results": 0, "error": "extraction_failed"}
+
+
 def _record_observation(args: dict) -> dict:
+    """Persist one observation under the immutable evidence contract.
+
+    Provider snippets are always discovery Tier C.  A/B is computed from the
+    URL, target domain and retrieval method; callers (including LLM output)
+    cannot promote evidence by supplying a tier string.
+    """
     run_id = args.get("run_id", "")
     node_type = args.get("node_type", "")
     if node_type not in _ALLOWED_NODE_TYPES:
@@ -876,6 +1484,25 @@ def _record_observation(args: dict) -> dict:
     if run is None:
         conn.close()
         raise ValueError("run is not initialized")
+    retrieval_method = str(args.get("retrieval_method", "browser"))[:80]
+    requested_tier = str(args.get("source_tier", "")).upper()
+    classification = classify_source(
+        source_url,
+        target_url=run["target_url"],
+        retrieval_method=retrieval_method,
+        content_type=str(args.get("content_type", "")),
+        search_snippet=requested_tier == "C" or retrieval_method in {"public_search", "tavily", "search_snippet"},
+    )
+    if requested_tier == "C":
+        tier = "C"
+        source_class = classification.source_class if classification.source_class != "first_party" else "search_snippet"
+        authority_reason = "caller_declared_discovery"
+    else:
+        tier = classification.tier if classification.tier in {"A", "B", "C"} else "C"
+        source_class = classification.source_class
+        authority_reason = classification.authority_reason
+    if tier in {"A", "B"} and not authority_reason:
+        tier, source_class, authority_reason = "C", "unknown", "missing_authority_reason_fail_closed"
     node_id = _stable_id(node_type, value)
     source_node_id = args.get("relation_from_node_id", "")
     source_type = ""
@@ -895,23 +1522,44 @@ def _record_observation(args: dict) -> dict:
     evidence_id = _stable_id("evidence", source_url, excerpt)
     edge_id = _stable_id("edge", source_node_id, node_id, relation, evidence_id)
     now = _now()
+    content_sha256 = str(args.get("content_sha256") or hashlib.sha256(excerpt.encode()).hexdigest())[:128]
     with conn:
-        conn.execute("INSERT OR IGNORE INTO evidence VALUES(?,?,?,?,?,?,?,?,?)", (evidence_id, source_url, args.get("source_title", ""), args.get("source_tier", "C"), now, excerpt, hashlib.sha256(excerpt.encode()).hexdigest(), args.get("retrieval_method", "browser"), args.get("access_status", "success")))
-        node_insert = conn.execute("INSERT OR IGNORE INTO nodes VALUES(?,?,?,?,?,?,?,?,?,?,?)", (node_id, node_type, value, value, "OBSERVED", float(args.get("confidence", 0.7)), _json([evidence_id]), _json([args.get("relation_from_node_id")] if args.get("relation_from_node_id") else []), run["round"], None, "OPEN"))
+        conn.execute(
+            """INSERT OR IGNORE INTO evidence(
+                evidence_id,source_url,source_title,source_tier,retrieved_at,excerpt,
+                content_sha256,retrieval_method,access_status,source_class,authority_reason,parent_search_id
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (evidence_id, source_url, str(args.get("source_title", ""))[:500], tier, now, excerpt,
+             content_sha256, retrieval_method, str(args.get("access_status", "success"))[:64],
+             source_class[:80], authority_reason[:240], str(args.get("parent_search_id", ""))[:128]),
+        )
+        node_insert = conn.execute(
+            "INSERT OR IGNORE INTO nodes VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (node_id, node_type, value, value, "OBSERVED", float(args.get("confidence", 0.7)),
+             _json([evidence_id]), _json([args.get("relation_from_node_id")] if args.get("relation_from_node_id") else []),
+             run["round"], None, "OPEN"),
+        )
+        if not node_insert.rowcount:
+            existing = conn.execute("SELECT evidence_ids FROM nodes WHERE node_id=?", (node_id,)).fetchone()
+            evidence_refs = json.loads(existing["evidence_ids"] or "[]") if existing else []
+            if evidence_id not in evidence_refs:
+                evidence_refs.append(evidence_id)
+                conn.execute("UPDATE nodes SET evidence_ids=? WHERE node_id=?", (_json(evidence_refs), node_id))
         if source_node_id:
             conn.execute("INSERT OR IGNORE INTO edges VALUES(?,?,?,?,?,?,?)", (edge_id, source_node_id, node_id, relation, float(args.get("confidence", 0.7)), _json([evidence_id]), run["round"]))
         if node_insert.rowcount:
             from tools.companyintel_pivots import expand_pivots
             planned_specs = expand_pivots(node_type, value)
             pivots = [spec.pivot_type for spec in planned_specs]
-            priority = max(spec.priority for spec in planned_specs)
-            conn.execute("INSERT OR REPLACE INTO frontier(node_id,priority,reason,planned_pivots,state) VALUES(?,?,?,?,?)", (node_id, priority, f"typed pivots for {node_type}", _json(pivots), "OPEN"))
-            _enqueue_frontier_tasks(conn, run_id, node_id, priority, pivots)
+            if pivots and args.get("enqueue_pivots", True):
+                priority = max(spec.priority for spec in planned_specs)
+                conn.execute("INSERT OR REPLACE INTO frontier(node_id,priority,reason,planned_pivots,state) VALUES(?,?,?,?,?)", (node_id, priority, f"typed pivots for {node_type}", _json(pivots), "OPEN"))
+                _enqueue_frontier_tasks(conn, run_id, node_id, priority, pivots)
         conn.execute("UPDATE run_state SET updated_at=? WHERE run_id=?", (now, run_id))
     _materialize(conn, run_id)
     _checkpoint(conn, run_id, "observation_recorded")
     conn.close()
-    return {"ok": True, "run_id": run_id, "node_id": node_id, "evidence_id": evidence_id, "edge_id": edge_id}
+    return {"ok": True, "run_id": run_id, "node_id": node_id, "evidence_id": evidence_id, "edge_id": edge_id, "source_tier": tier, "source_class": source_class, "authority_reason": authority_reason}
 
 
 def _record_search(args: dict) -> dict:
@@ -921,9 +1569,23 @@ def _record_search(args: dict) -> dict:
     if run is None:
         conn.close()
         raise ValueError("run is not initialized")
-    search_id = args.get("search_id") or _stable_id("search", args.get("query", ""), args.get("source", ""), _now())
+    query = str(args.get("query", ""))[:1000]
+    source = str(args.get("source", ""))[:200]
+    provider = str(args.get("provider", "") or source)[:200]
+    mode = str(args.get("mode", args.get("pivot_type", "")))[:80]
+    from tools.companyintel_public_search import normalized_query
+    query_key = str(args.get("query_key") or f"{provider}|{normalized_query(query)}|{mode}")[:1400]
+    search_id = args.get("search_id") or _stable_id("search", query_key, _now())
     with conn:
-        conn.execute("INSERT OR REPLACE INTO search_log VALUES(?,?,?,?,?,?,?,?,?)", (search_id, run["round"], args.get("pivot_node_id", ""), args.get("pivot_type", ""), str(args.get("query", ""))[:1000], args.get("source", ""), args.get("status", "completed"), _json(args.get("new_node_ids", [])), args.get("limitation")))
+        conn.execute(
+            "INSERT OR REPLACE INTO search_log(search_id,round,pivot_node_id,pivot_type,query,source,status,new_node_ids,limitation,provider,attempt_count,query_key,technical_error) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                search_id, run["round"], args.get("pivot_node_id", ""), args.get("pivot_type", ""),
+                query, source, args.get("status", "completed"), _json(args.get("new_node_ids", [])),
+                args.get("limitation"), provider, max(0, int(args.get("attempt_count", 0))),
+                query_key, args.get("technical_error"),
+            ),
+        )
         conn.execute("UPDATE run_state SET updated_at=? WHERE run_id=?", (_now(), run_id))
     _materialize(conn, run_id)
     count = conn.execute("SELECT COUNT(*) FROM search_log").fetchone()[0]
@@ -936,17 +1598,26 @@ def _record_search(args: dict) -> dict:
 def _execute_frontier(args: dict) -> dict:
     """Execute the first registered worker slice: bounded public exact search."""
     from tools.companyintel_pivots import get_pivot
-    from tools.companyintel_public_search import SearchLimits, execute_public_search
+    from tools.companyintel_public_search import (
+        SearchLimits,
+        active_provider_name,
+        configured_search_limits,
+        build_query,
+        execute_public_search,
+        normalized_query,
+    )
 
     run_id = args.get("run_id", "")
     pivot_type = str(args.get("pivot_type", "exact_search")).strip() or "exact_search"
     spec = get_pivot(pivot_type)
     worker_configs = {
-        "public_search": {"mode": "exact", "node_type": "url", "relation": "search_result", "source": "duckduckgo_html"},
-        "maps_search": {"mode": "maps", "node_type": "place", "relation": "maps_result", "source": "duckduckgo_maps_search"},
-        "marketplace_search": {"mode": "marketplace", "node_type": "marketplace_profile", "relation": "marketplace_result", "source": "duckduckgo_marketplace_search"},
-        "document_search": {"mode": "document", "node_type": "document", "relation": "document_result", "source": "duckduckgo_document_search"},
+        "public_search": {"mode": "exact", "node_type": "url", "relation": "search_result", "source": "public_search"},
+        "maps_search": {"mode": "maps", "node_type": "place", "relation": "maps_result", "source": "maps_search"},
+        "marketplace_search": {"mode": "marketplace", "node_type": "marketplace_profile", "relation": "marketplace_result", "source": "marketplace_search"},
+        "document_search": {"mode": "document", "node_type": "document", "relation": "document_result", "source": "document_search"},
     }
+    if spec is not None and spec.worker == "document_extraction":
+        return _execute_document_extraction_frontier(args)
     if spec is None:
         raise ValueError("unknown pivot type")
     if not spec.implemented:
@@ -965,28 +1636,109 @@ def _execute_frontier(args: dict) -> dict:
     if node is None:
         _lease_mutation({**args, "task_id": task["task_id"], "worker_id": worker_id, "lease_token": task["lease_token"], "error": "pivot node not found"}, "fail")
         return {"ok": False, "outcome": "FAILED", "task_id": task["task_id"], "persisted_results": 0}
+    provider_name = active_provider_name()
+    query = build_query(node["node_type"], node["value"], mode=worker_config["mode"])
+    query_key = f"{provider_name}|{normalized_query(query)}|{worker_config['mode']}"
+    conn = _connect(run_id)
+    now = time.time()
+    circuit = conn.execute(
+        "SELECT state,retry_at,reason FROM search_provider_circuits WHERE run_id=? AND provider=?",
+        (run_id, provider_name),
+    ).fetchone()
+    duplicate = conn.execute(
+        "SELECT search_id FROM search_log WHERE query_key=? AND status IN ('COMPLETED_WITH_RESULTS','COMPLETED_ZERO_RESULTS') LIMIT 1",
+        (query_key,),
+    ).fetchone()
+    conn.close()
+    if circuit is not None and circuit["state"] == "OPEN" and (circuit["retry_at"] is None or float(circuit["retry_at"]) > now):
+        skipped = _lease_mutation({
+            **args, "task_id": task["task_id"], "worker_id": worker_id,
+            "lease_token": task["lease_token"],
+            "error": "provider_circuit_open:" + str(circuit["reason"] or provider_name),
+            "skip_state": "SKIPPED_PROVIDER_BLOCKED",
+        }, "skip")
+        return {
+            "ok": True, "outcome": "SKIPPED_PROVIDER_BLOCKED", "task_id": task["task_id"],
+            "state": skipped["state"], "persisted_results": 0,
+            "error": "Search provider circuit is open; execution continued with available sources.",
+        }
+    if duplicate is not None:
+        skipped = _lease_mutation({
+            **args, "task_id": task["task_id"], "worker_id": worker_id,
+            "lease_token": task["lease_token"],
+            "error": "duplicate_provider_query_skipped",
+            "skip_state": "SKIPPED_DEDUPLICATED",
+        }, "skip")
+        return {
+            "ok": True, "outcome": "SKIPPED_DEDUPLICATED", "task_id": task["task_id"],
+            "state": skipped["state"], "persisted_results": 0,
+            "error": "Equivalent provider query was already completed.",
+        }
+    configured_limits = configured_search_limits()
     result = execute_public_search(
         node["node_type"],
         node["value"],
         limits=SearchLimits(
-            timeout_seconds=min(15.0, max(1.0, float(args.get("search_timeout_seconds", 8)))),
-            max_bytes=min(512 * 1024, max(4096, int(args.get("search_max_bytes", 256 * 1024)))),
-            max_results=min(20, max(1, int(args.get("search_max_results", 10)))),
+            timeout_seconds=min(15.0, max(1.0, float(args.get("search_timeout_seconds", configured_limits.timeout_seconds)))),
+            max_bytes=min(512 * 1024, max(4096, int(args.get("search_max_bytes", configured_limits.max_bytes)))),
+            max_results=min(20, max(1, int(args.get("search_max_results", configured_limits.max_results)))),
+            max_attempts=min(3, max(1, int(args.get("search_max_attempts", configured_limits.max_attempts)))),
+            deadline_seconds=min(120.0, max(1.0, float(args.get("search_deadline_seconds", configured_limits.deadline_seconds)))),
+            retry_backoff_seconds=min(8.0, max(0.0, float(args.get("search_retry_backoff_seconds", configured_limits.retry_backoff_seconds)))),
+            retry_jitter_seconds=min(1.0, max(0.0, float(args.get("search_retry_jitter_seconds", configured_limits.retry_jitter_seconds)))),
         ),
         mode=worker_config["mode"],
     )
-    if result["outcome"] in {"RETRYABLE_ERROR", "UNAVAILABLE"}:
+    provider = str(result.get("provider") or provider_name)
+    outcome = str(result.get("outcome", "INVALID_RESPONSE"))
+    if outcome in {"RETRYABLE_ERROR", "RATE_LIMITED", "UNAVAILABLE", "BLOCKED_BY_CAPTCHA", "AUTH_FAILED", "INVALID_RESPONSE"}:
+        _record_search({
+            "run_id": run_id, "pivot_node_id": task["node_id"], "pivot_type": pivot_type,
+            "query": result.get("query", query), "source": provider, "provider": provider,
+            "status": outcome, "new_node_ids": [], "limitation": result.get("error"),
+            "technical_error": result.get("technical_error"), "attempt_count": result.get("attempt_count", 0),
+            "mode": worker_config["mode"], "query_key": query_key,
+        })
+        if outcome == "BLOCKED_BY_CAPTCHA":
+            skipped = _lease_mutation({
+                **args, "task_id": task["task_id"], "worker_id": worker_id,
+                "lease_token": task["lease_token"],
+                "error": "provider_circuit_open:" + provider,
+                "skip_state": "SKIPPED_PROVIDER_BLOCKED",
+            }, "skip")
+            conn = _connect(run_id)
+            with conn:
+                _trip_public_search_circuit(
+                    conn, run_id, provider,
+                    result.get("technical_error") or result.get("error") or outcome,
+                )
+            conn.close()
+            return {"ok": True, "outcome": outcome, "task_id": task["task_id"], "state": skipped["state"], "persisted_results": 0, "error": result.get("error")}
         failure = _lease_mutation({
-            **args,
-            "task_id": task["task_id"],
-            "worker_id": worker_id,
+            **args, "task_id": task["task_id"], "worker_id": worker_id,
             "lease_token": task["lease_token"],
-            "error": result.get("error") or result["outcome"],
+            "error": result.get("error") or outcome,
             "retry_after_seconds": args.get("retry_after_seconds", 30),
+            "retryable": outcome in {"RETRYABLE_ERROR", "RATE_LIMITED"} and int(task["attempt"]) < int(task["max_attempts"]),
         }, "fail")
-        return {"ok": True, "outcome": result["outcome"], "task_id": task["task_id"], "state": failure["state"], "persisted_results": 0, "error": result.get("error")}
+        if outcome in {"RETRYABLE_ERROR", "RATE_LIMITED"} and int(task["attempt"]) >= int(task["max_attempts"]):
+            conn = _connect(run_id)
+            with conn:
+                _trip_public_search_circuit(conn, run_id, provider, result.get("technical_error") or result.get("error") or outcome)
+            conn.close()
+        return {"ok": True, "outcome": outcome, "task_id": task["task_id"], "state": failure["state"], "persisted_results": 0, "error": result.get("error")}
     new_node_ids = []
     persisted = 0
+    search_payload = {
+        "run_id": run_id, "pivot_node_id": task["node_id"], "pivot_type": pivot_type,
+        "query": result["query"], "source": result.get("provider") or worker_config["source"],
+        "provider": result.get("provider") or provider_name, "status": result["outcome"],
+        "new_node_ids": [], "limitation": None, "technical_error": None,
+        "attempt_count": result.get("attempt_count", 1), "mode": worker_config["mode"], "query_key": query_key,
+    }
+    # Record discovery before child observations so every verified extraction
+    # can retain its parent search id without a second path lookup.
+    search_record = _record_search(search_payload)
     for item in result["results"]:
         observation = _record_observation({
             "run_id": run_id,
@@ -998,21 +1750,14 @@ def _execute_frontier(args: dict) -> dict:
             "relation_from_node_id": task["node_id"],
             "relation": worker_config["relation"],
             "retrieval_method": "public_search",
+            "source_tier": "C",
+            "parent_search_id": search_record["search_id"],
             "access_status": "success",
         })
         if observation.get("ok"):
             persisted += 1
             new_node_ids.append(observation["node_id"])
-    _record_search({
-        "run_id": run_id,
-        "pivot_node_id": task["node_id"],
-        "pivot_type": pivot_type,
-        "query": result["query"],
-        "source": worker_config["source"],
-        "status": result["outcome"],
-        "new_node_ids": new_node_ids,
-        "limitation": None,
-    })
+    _record_search({**search_payload, "search_id": search_record["search_id"], "new_node_ids": new_node_ids})
     completed = _lease_mutation({
         **args,
         "task_id": task["task_id"],
@@ -1063,6 +1808,7 @@ def _execute_inventory_frontier(args: dict) -> dict:
 
 def _persist_reasoning_decision(conn: sqlite3.Connection, run_id: str, decision: dict) -> dict:
     """Persist a validated controller decision without granting graph authority."""
+    reasoning_provider, reasoning_model = _reasoning_route_metadata()
     decision_type = str(decision.get("decision_type", "")).strip()
     if not decision_type:
         raise ValueError("reasoning decision_type is required")
@@ -1070,7 +1816,7 @@ def _persist_reasoning_decision(conn: sqlite3.Connection, run_id: str, decision:
     now = _now()
     conn.execute(
         "INSERT OR REPLACE INTO reasoning_decisions(decision_id,run_id,decision_type,decision_json,model,provider,graph_revision,created_at) VALUES(?,?,?,?,?,?,?,?)",
-        (decision_id, run_id, decision_type, _json(decision), "nvidia/nemotron-3-ultra-550b-a55b:free", "openrouter", "", now),
+        (decision_id, run_id, decision_type, _json(decision), reasoning_model, reasoning_provider, "", now),
     )
     return {"decision_id": decision_id, "decision_type": decision_type}
 
@@ -1129,31 +1875,55 @@ def _reasoning_cycle(args: dict) -> dict:
         }
         controller = CompanyIntelReasoningController()
         decisions = []
-        try:
-            hypotheses = controller.generate_hypotheses_with_llm(payload=payload, evidence_ids=evidence_ids)
-            for decision in hypotheses:
-                decisions.append(_persist_reasoning_decision(conn, run_id, decision))
-        except (ValueError, TypeError, KeyError, RuntimeError) as exc:
-            decisions.append(_persist_reasoning_rejection(conn, run_id, "generate_hypotheses", exc))
+
+        def record_reasoning(operation, producer, *, many=False):
+            """Persist advisory reasoning without letting provider failures own run state."""
+            try:
+                proposed = producer()
+                proposals = proposed if many else [proposed]
+                if not isinstance(proposals, list):
+                    raise TypeError("reasoning proposal collection must be a list")
+                if not all(isinstance(decision, dict) for decision in proposals):
+                    raise TypeError("reasoning proposals must be objects")
+                for decision in proposals:
+                    decisions.append(_persist_reasoning_decision(conn, run_id, decision))
+            except (ValueError, TypeError, KeyError, RuntimeError) as exc:
+                decisions.append(_persist_reasoning_rejection(conn, run_id, operation, exc))
+
+        record_reasoning(
+            "generate_hypotheses",
+            lambda: controller.generate_hypotheses_with_llm(payload=payload, evidence_ids=evidence_ids),
+            many=True,
+        )
         if candidates or args.get("force_all"):
-            decision = controller.compare_candidates_with_llm(payload=payload)
-            decisions.append(_persist_reasoning_decision(conn, run_id, decision))
+            record_reasoning(
+                "compare_candidates",
+                lambda: controller.compare_candidates_with_llm(payload=payload),
+            )
         if contradictions or args.get("force_all"):
-            decision = controller.analyze_contradictions_with_llm(payload={**payload, "contradictions": contradictions})
-            decisions.append(_persist_reasoning_decision(conn, run_id, decision))
+            record_reasoning(
+                "analyze_contradictions",
+                lambda: controller.analyze_contradictions_with_llm(payload={**payload, "contradictions": contradictions}),
+            )
         if eligible and (args.get("force_all") or len({item["priority"] for item in eligible}) == 1):
-            decision = controller.select_equal_priority_pivot_with_llm(payload={**payload, "node_id": node_id})
-            decisions.append(_persist_reasoning_decision(conn, run_id, decision))
+            record_reasoning(
+                "select_equal_priority_pivot",
+                lambda: controller.select_equal_priority_pivot_with_llm(payload={**payload, "node_id": node_id}),
+            )
         if contradictions or args.get("force_all"):
             ambiguity_payload = {**payload, "ambiguity_type": "candidate_conflict", "subject_ids": subject_ids, "conflicts": [item["candidate_id"] for item in contradictions]}
-            decision = controller.interpret_ambiguity_with_llm(payload={**ambiguity_payload, "evidence_ids": sorted(evidence_ids)})
-            decisions.append(_persist_reasoning_decision(conn, run_id, decision))
+            record_reasoning(
+                "interpret_ambiguity",
+                lambda: controller.interpret_ambiguity_with_llm(payload={**ambiguity_payload, "evidence_ids": sorted(evidence_ids)}),
+            )
         if args.get("force_all"):
-            decision = controller.decide_weak_branch_with_llm(payload={
-                **payload, "clue_id": node_id, "clue_strength": "weak", "allowed_pivots": eligible,
-                "max_new_tasks": 2, "max_budget_cost": 2, "current_depth": 0, "max_depth": 2,
-            })
-            decisions.append(_persist_reasoning_decision(conn, run_id, decision))
+            record_reasoning(
+                "decide_weak_branch",
+                lambda: controller.decide_weak_branch_with_llm(payload={
+                    **payload, "clue_id": node_id, "clue_strength": "weak", "allowed_pivots": eligible,
+                    "max_new_tasks": 2, "max_budget_cost": 2, "current_depth": 0, "max_depth": 2,
+                }),
+            )
         conn.execute("UPDATE run_state SET updated_at=? WHERE run_id=?", (_now(), run_id))
         conn.commit()
         _materialize(conn, run_id)
@@ -1166,6 +1936,53 @@ def _reasoning_cycle(args: dict) -> dict:
         conn.close()
 
 
+def _reconcile_redundant_url_tasks(conn: sqlite3.Connection, run_id: str) -> int:
+    """Retire URL-level web searches created by pre-planner-v2 runs."""
+    cursor = conn.execute(
+        """UPDATE frontier_tasks
+           SET state='SKIPPED_REDUNDANT', worker_id=NULL, lease_token=NULL,
+               lease_expires_at=NULL, last_error='redundant_url_search_removed_by_planner_v2', updated_at=?
+           WHERE run_id=? AND state IN ('OPEN','RETRY_WAIT')
+             AND pivot_type IN ('exact_search','documents')
+             AND node_id IN (SELECT node_id FROM nodes WHERE node_type='url')""",
+        (_now(), run_id),
+    )
+    return cursor.rowcount
+
+
+def _trip_public_search_circuit(conn: sqlite3.Connection, run_id: str, provider: str, reason: str) -> int:
+    """Persist an open provider circuit and fail closed for this run."""
+    safe_provider = " ".join(str(provider).split())[:80] or "none"
+    safe_reason = " ".join(str(reason).split())[:300]
+    now = time.time()
+    previous = conn.execute(
+        "SELECT failure_count FROM search_provider_circuits WHERE run_id=? AND provider=?",
+        (run_id, safe_provider),
+    ).fetchone()
+    failure_count = int(previous["failure_count"] if previous else 0) + 1
+    retry_at = now + min(900.0, 60.0 * failure_count)
+    conn.execute(
+        "INSERT OR REPLACE INTO search_provider_circuits(run_id,provider,state,reason,opened_at,retry_at,failure_count) VALUES(?,?,?,?,?,?,?)",
+        (run_id, safe_provider, "OPEN", safe_reason, _now(), retry_at, failure_count),
+    )
+    cursor = conn.execute(
+        """UPDATE frontier_tasks
+           SET state='SKIPPED_PROVIDER_BLOCKED', worker_id=NULL, lease_token=NULL,
+               lease_expires_at=NULL, last_error=?, updated_at=?
+           WHERE run_id=? AND state IN ('OPEN','RETRY_WAIT')
+             AND pivot_type IN ({})""".format(",".join("?" * len(_SEARCH_PIVOT_TYPES))),
+        tuple([f"provider_circuit_open:{safe_provider}", _now(), run_id, *_SEARCH_PIVOT_TYPES]),
+    )
+    _append_event_conn(
+        conn,
+        run_id,
+        "search.provider_circuit",
+        {"provider": safe_provider, "state": "OPEN", "reason": safe_reason, "failure_count": failure_count},
+        f"search-circuit:{run_id}:{safe_provider}:{failure_count}",
+    )
+    return cursor.rowcount
+
+
 def _run_frontier(args: dict) -> dict:
     """Run a bounded automatic dispatch loop over supported typed pivots."""
     run_id = args.get("run_id", "")
@@ -1174,12 +1991,32 @@ def _run_frontier(args: dict) -> dict:
         raise ValueError("worker_id is required")
     max_tasks = min(50, max(1, int(args.get("max_tasks", 10))))
     outcomes = []
-    supported = ("site_inventory", "exact_search", "maps", "marketplaces", "documents")
+    supported = ("site_inventory", "document_extraction", "exact_search", "maps", "marketplaces", "documents")
+    conn = _connect(run_id)
+    with conn:
+        retired_url_tasks = _reconcile_redundant_url_tasks(conn, run_id)
+        if retired_url_tasks:
+            _append_event_conn(
+                conn,
+                run_id,
+                "frontier.migrated",
+                {
+                    "migration": "planner_v2_url_search_reconciliation",
+                    "count": retired_url_tasks,
+                    "reason": "redundant_url_search_removed_by_planner_v2",
+                },
+                f"frontier-migration:{run_id}:planner-v2",
+            )
+    if retired_url_tasks:
+        _materialize(conn, run_id)
+    conn.close()
     while len(outcomes) < max_tasks:
         dispatched = None
         for pivot_type in supported:
             if pivot_type == "site_inventory":
                 candidate = _execute_inventory_frontier(args)
+            elif pivot_type == "document_extraction":
+                candidate = _execute_document_extraction_frontier(args)
             else:
                 candidate = _execute_frontier({**args, "pivot_type": pivot_type})
             if candidate.get("outcome") != "NO_TASK":
@@ -1193,7 +2030,7 @@ def _run_frontier(args: dict) -> dict:
     for row in conn.execute("SELECT task_id,pivot_type FROM frontier_tasks WHERE run_id=? AND state='OPEN'", (run_id,)).fetchall():
         spec = get_pivot(row["pivot_type"])
         if spec is None or not spec.implemented:
-            conn.execute("UPDATE frontier_tasks SET state='SKIPPED_UNSUPPORTED',last_error='typed_worker_not_implemented',updated_at=? WHERE task_id=?", (_now(), row["task_id"]))
+            conn.execute("UPDATE frontier_tasks SET state='BLOCKED_CAPABILITY',last_error=?,updated_at=? WHERE task_id=?", (f"CAPABILITY_UNAVAILABLE:capability={row['pivot_type']};reason=worker_not_installed", _now(), row["task_id"]))
     conn.commit()
     run_row = conn.execute("SELECT * FROM run_state WHERE run_id=?", (run_id,)).fetchone()
     unresolved = conn.execute("SELECT COUNT(*) FROM frontier_tasks WHERE run_id=? AND state IN ('OPEN','CLAIMED','RETRY_WAIT')", (run_id,)).fetchone()[0]
@@ -1201,12 +2038,44 @@ def _run_frontier(args: dict) -> dict:
         now = _now()
         conn.execute("UPDATE frontier SET state='CLOSED' WHERE node_id IN (SELECT node_id FROM frontier_tasks WHERE run_id=?) AND state='OPEN'", (run_id,))
         conn.execute("UPDATE nodes SET frontier_state='CLOSED' WHERE node_id IN (SELECT node_id FROM frontier_tasks WHERE run_id=?) AND frontier_state='OPEN'", (run_id,))
-        conn.execute("UPDATE run_state SET saturation_reason=COALESCE(saturation_reason,'FRONTIER_EXHAUSTED:all_scheduled_tasks_completed'),updated_at=? WHERE run_id=?", (now, run_id))
+        failed_tasks = conn.execute(
+            "SELECT COUNT(*) FROM frontier_tasks WHERE run_id=? AND state IN ('FAILED','SKIPPED_PROVIDER_BLOCKED')",
+            (run_id,),
+        ).fetchone()[0]
+        unavailable = conn.execute(
+            "SELECT COUNT(*) FROM search_log WHERE status='UNAVAILABLE' AND provider='none'",
+            (),
+        ).fetchone()[0]
+        if unavailable:
+            saturation = "FRONTIER_BLOCKED_PROVIDER_UNAVAILABLE"
+        elif failed_tasks:
+            saturation = "FRONTIER_EXHAUSTED_WITH_FAILURES"
+        else:
+            saturation = "FRONTIER_EXHAUSTED:all_scheduled_tasks_completed"
+        conn.execute(
+            "UPDATE run_state SET saturation_reason=COALESCE(saturation_reason,?),last_stop_reason=?,updated_at=? WHERE run_id=?",
+            (saturation, saturation, now, run_id),
+        )
     elif run_row and run_row["status"] == "RUNNING" and run_row["tasks_executed"] >= run_row["max_tasks"]:
-        conn.execute("UPDATE run_state SET status='PARTIAL',saturation_reason='BUDGET_EXHAUSTED:max_tasks',updated_at=? WHERE run_id=?", (_now(), run_id))
+        budget_reason = "BUDGET_EXHAUSTED:frontier_budget"
+        legacy_budget_reason = "BUDGET_EXHAUSTED:max_tasks"
+        generation = int(run_row["execution_generation"] or 0)
+        conn.execute(
+            "UPDATE run_state SET status='PARTIAL',saturation_reason=?,last_stop_reason=?,terminal_reason=NULL,updated_at=? WHERE run_id=?",
+            (legacy_budget_reason, budget_reason, _now(), run_id),
+        )
+        _append_event_conn(
+            conn, run_id, "run.status",
+            {
+                "from": "RUNNING", "to": "PARTIAL", "reason": budget_reason,
+                "legacy_reason": legacy_budget_reason,
+                "execution_generation": generation, "resume_generation": generation,
+            },
+            f"budget:{run_id}:{generation}:{run_row['tasks_executed']}",
+        )
         conn.commit()
         _materialize(conn, run_id)
-        _checkpoint(conn, run_id, "budget_exhausted_max_tasks")
+        _checkpoint(conn, run_id, "budget_exhausted_frontier_budget")
     else:
         conn.execute("UPDATE run_state SET updated_at=? WHERE run_id=?", (_now(), run_id))
         conn.commit()
@@ -1217,15 +2086,43 @@ def _run_frontier(args: dict) -> dict:
         _materialize(conn, run_id)
         _checkpoint(conn, run_id, "frontier_saturation_check")
 
+    final_run = conn.execute(
+        "SELECT status,saturation_reason,last_stop_reason FROM run_state WHERE run_id=?",
+        (run_id,),
+    ).fetchone()
+    if final_run is None:
+        conn.close()
+        raise ValueError("run is not initialized")
+    durable_status = str(final_run["status"] or "")
+    stop_reason = str(final_run["saturation_reason"] or final_run["last_stop_reason"] or "")
+    conn.close()
+
     legal_identity = _legal_identity_exhaustion({"run_id": run_id})
+    # Preserve the distinct machine-readable stop reason after the coverage
+    # projection updates the same durable row.
+    conn = _connect(run_id)
+    with conn:
+        current = conn.execute("SELECT status,saturation_reason,last_stop_reason FROM run_state WHERE run_id=?", (run_id,)).fetchone()
+        if current and current["status"] == "PARTIAL" and str(current["saturation_reason"] or "").startswith("BUDGET_EXHAUSTED:") and not current["last_stop_reason"]:
+            conn.execute("UPDATE run_state SET last_stop_reason=? WHERE run_id=?", ("BUDGET_EXHAUSTED:frontier_budget", run_id))
+    conn.close()
     reasoning = None
     if args.get("reasoning_enabled"):
-        reasoning = _reasoning_cycle({**args, "run_id": run_id})
+        if durable_status == "RUNNING":
+            reasoning = _reasoning_cycle({**args, "run_id": run_id})
+        else:
+            reasoning = {
+                "ok": True,
+                "skipped": "run_not_running",
+                "durable_status": durable_status,
+            }
     return {
         "ok": True,
         "run_id": run_id,
         "worker_id": worker_id,
         "tasks_executed": len(outcomes),
+        "durable_status": durable_status,
+        "stop_reason": stop_reason,
         "legal_identity_exhaustion": legal_identity,
         "outcomes": outcomes,
         "remaining_supported_tasks": sum(1 for item in outcomes if item.get("state") in {"RETRY_WAIT", "CLAIMED"}),
@@ -1435,8 +2332,25 @@ def _resume_frontier(args: dict) -> dict:
         additional_tasks = min(500, max(1, int(args.get("additional_tasks", 25))))
         additional_searches = min(2000, max(1, int(args.get("additional_searches", additional_tasks))))
         deadline_seconds = min(86400.0, max(60.0, float(args.get("deadline_seconds", 3600))))
-        conn.execute("UPDATE run_state SET status='RUNNING',max_tasks=max_tasks+?,max_searches=max_searches+?,deadline_at=?,saturation_reason=NULL,retry_at=NULL,retry_reason=NULL,resume_count=resume_count+1,updated_at=? WHERE run_id=?", (additional_tasks, additional_searches, now + deadline_seconds, _now(), run_id))
+        previous_generation = int(row["execution_generation"] or 0)
+        previous_stop_reason = row["last_stop_reason"] or row["saturation_reason"] or row["retry_reason"]
+        new_generation = previous_generation + 1
+        conn.execute(
+            "UPDATE run_state SET status='RUNNING',max_tasks=max_tasks+?,max_searches=max_searches+?,deadline_at=?,saturation_reason=NULL,last_stop_reason=?,terminal_reason=NULL,retry_at=NULL,retry_reason=NULL,resume_count=resume_count+1,execution_generation=?,updated_at=? WHERE run_id=?",
+            (additional_tasks, additional_searches, now + deadline_seconds, previous_stop_reason, new_generation, _now(), run_id),
+        )
+        resume_event = _append_event_conn(
+            conn, run_id, "run.resumed",
+            {
+                "from_generation": previous_generation, "execution_generation": new_generation,
+                "resume_generation": new_generation, "previous_stop_reason": previous_stop_reason,
+                "status": "RUNNING",
+            },
+            f"resume:{run_id}:{new_generation}",
+        )
         conn.commit()
+        _materialize(conn, run_id)
+        _checkpoint(conn, run_id, "resume_started")
     except Exception:
         conn.rollback()
         raise
@@ -1445,6 +2359,9 @@ def _resume_frontier(args: dict) -> dict:
     result = _run_frontier({**args, "worker_id": args.get("worker_id") or f"resume-{run_id}"})
     result["status"] = _summary({"run_id": run_id})["status"]
     result["resumed"] = True
+    result["execution_generation"] = new_generation
+    result["resume_generation"] = new_generation
+    result["resume_event"] = resume_event
     return result
 
 
@@ -1532,7 +2449,7 @@ def _transition_run(args: dict) -> dict:
         raise ValueError(f"unsupported run status: {target}")
     conn = _connect(run_id)
     try:
-        row = conn.execute("SELECT status FROM run_state WHERE run_id=?", (run_id,)).fetchone()
+        row = conn.execute("SELECT status,execution_generation,last_stop_reason FROM run_state WHERE run_id=?", (run_id,)).fetchone()
         if row is None:
             raise ValueError("run is not initialized")
         current = row["status"]
@@ -1546,13 +2463,36 @@ def _transition_run(args: dict) -> dict:
             reviews = conn.execute("SELECT COUNT(*) FROM report_reviews WHERE run_id=?", (run_id,)).fetchone()[0]
             if open_tasks or not saturation or str(saturation).startswith("BUDGET_EXHAUSTED:") or not artifacts or not reviews:
                 raise ValueError("completion requires frontier exhaustion, non-budget saturation_reason, report_artifact and report_review")
+        terminal_reason = reason if target in {"COMPLETED", "FAILED", "CANCELLED"} and reason else None
+        last_stop_reason = reason if target in {"RESUMABLE", "PARTIAL", "FAILED", "CANCELLED"} and reason else row["last_stop_reason"]
+        generation = int(row["execution_generation"] or 0)
         conn.execute("BEGIN IMMEDIATE")
-        conn.execute("UPDATE run_state SET status=?,retry_reason=CASE WHEN ? IN ('RUNNING','COMPLETED','FAILED','CANCELLED','PARTIAL') THEN NULL ELSE retry_reason END,updated_at=? WHERE run_id=?", (target, target, _now(), run_id))
-        event = _append_event_conn(conn, run_id, "run.status", {"from": current, "to": target, "reason": reason}, args.get("idempotency_key", f"status:{current}:{target}:{reason}"))
+        conn.execute(
+            "UPDATE run_state SET status=?,terminal_reason=?,last_stop_reason=?,retry_reason=CASE WHEN ? IN ('RUNNING','COMPLETED','FAILED','CANCELLED','PARTIAL') THEN NULL ELSE retry_reason END,updated_at=? WHERE run_id=?",
+            (target, terminal_reason, last_stop_reason, target, _now(), run_id),
+        )
+        event = _append_event_conn(
+            conn, run_id, "run.status",
+            {
+                "from": current, "to": target, "reason": reason,
+                "execution_generation": generation, "resume_generation": generation,
+                "terminal_reason": terminal_reason,
+            },
+            args.get("idempotency_key", f"status:{current}:{target}:{reason}"),
+        )
         if target == "COMPLETED":
-            _append_event_conn(conn, run_id, "run.completed", {"status": "COMPLETED", "reason": reason}, f"completed:{run_id}")
+            _append_event_conn(
+                conn, run_id, "run.completed",
+                {
+                    "status": "COMPLETED", "reason": reason,
+                    "execution_generation": generation, "resume_generation": generation,
+                    "terminal_reason": terminal_reason,
+                },
+                f"completed:{run_id}",
+            )
         conn.commit()
-        return {"ok": True, "run_id": run_id, "from": current, "status": target, "event": event}
+        _materialize(conn, run_id)
+        return {"ok": True, "run_id": run_id, "from": current, "status": target, "event": event, "execution_generation": generation}
     except Exception:
         conn.rollback()
         raise
@@ -1561,8 +2501,17 @@ def _transition_run(args: dict) -> dict:
 
 
 def _generate_report(args: dict) -> dict:
+    """Generate a report with durable synthesis/review checkpoints.
+
+    A successful synthesis is committed before review starts.  If the provider
+    fails during review, the draft remains resumable and only review is retried
+    when the same graph revision is presented.
+    """
     run_id = args["run_id"]
+    reasoning_provider, reasoning_model = _reasoning_route_metadata()
     conn = _connect(run_id)
+    report_stage = "report_synthesis"
+    graph_revision = ""
     try:
         run = conn.execute("SELECT * FROM run_state WHERE run_id=?", (run_id,)).fetchone()
         if run is None:
@@ -1572,19 +2521,118 @@ def _generate_report(args: dict) -> dict:
             raise ValueError("run projection is not available")
         graph_bytes = graph_path.read_bytes()
         graph = json.loads(graph_bytes)
-        graph_revision = hashlib.sha256(graph_bytes).hexdigest()
+        graph_revision = _report_content_revision(graph)
         frontier_open = int(graph["research_state"].get("frontier_open", 0))
         saturation_reason = graph["research_state"].get("saturation_reason")
+        search_log = graph.get("search_log", [])
+        search_statuses = [str(row.get("status", "")) for row in search_log]
+        search_provider_auth_failed = any(status == "AUTH_FAILED" for status in search_statuses)
+        search_success = sum(status in {"COMPLETED_WITH_RESULTS", "COMPLETED_ZERO_RESULTS"} for status in search_statuses)
+        failed_tasks = sum(str(row.get("state", "")) in {"FAILED", "SKIPPED_PROVIDER_BLOCKED"} for row in graph.get("frontier_tasks", []))
+        unsupported_capabilities = sorted({
+            str(row.get("pivot_type")) for row in graph.get("frontier_tasks", [])
+            if str(row.get("state", "")) in {"BLOCKED_CAPABILITY", "SKIPPED_UNSUPPORTED"}
+        })
+        evidence_tiers = {str(row.get("source_tier") or "C").upper() for row in graph.get("evidence", [])}
+        # Quality evidence must come from code-owned A/B provenance.  Direct
+        # report_text/reasoning arguments are never allowed to bypass the gate.
+        has_quality_evidence = bool(evidence_tiers & {"A", "B"})
+        finding_count = sum(1 for row in graph.get("nodes", []) if str(row.get("node_type", "")) == "finding")
+        critical_coverage = bool(graph.get("identity_candidates", [])) or finding_count > 0
+        blocking_contradictions = [
+            row for row in graph.get("identity_candidates", [])
+            if row.get("conflicting_dimensions")
+            and str(row.get("status", "")).upper() not in {"REJECTED", "RESOLVED"}
+        ]
+        frontier_exhausted_with_failures = bool(failed_tasks and search_log and search_success == 0)
+        # Registry/social/archive adapters are explicit optional limitations until
+        # a country-specific adapter is selected; document extraction is required
+        # whenever a URL task was scheduled and is now implemented in code.
+        required_capabilities = sorted({
+            name for name in unsupported_capabilities if name in {"document_extraction"}
+        })
+        missing_required = [name for name in required_capabilities if name in unsupported_capabilities]
         gate = {
             "terminal": run["status"] == "COMPLETED" or bool(args.get("terminal_transition_pending")),
             "has_nodes": len(graph.get("nodes", [])) > 0,
             "has_evidence": len(graph.get("evidence", [])) > 0,
-            "frontier_exhausted": frontier_open == 0 or bool(saturation_reason),
+            "frontier_exhausted": frontier_open == 0 and bool(saturation_reason),
+            "search_provider_auth_failed": not search_provider_auth_failed,
+            "search_coverage": search_success > 0,
+            "evidence_quality": has_quality_evidence,
+            "critical_coverage": critical_coverage,
+            "no_unresolved_blocking_contradictions": not blocking_contradictions,
+            "frontier_exhausted_with_failures": not frontier_exhausted_with_failures,
+            "required_capabilities": required_capabilities,
+            "missing_capabilities": sorted(unsupported_capabilities),
+            "failed_tasks": failed_tasks,
+            "evidence_tiers": sorted(evidence_tiers),
+            "finding_count": finding_count,
+            "candidate_count": len(graph.get("identity_candidates", [])),
+            "blocking_contradiction_count": len(blocking_contradictions),
             "saturation_reason": saturation_reason,
+            "report_mode": str(args.get("report_mode", "full")),
         }
-        gate["result"] = "PASS" if all(gate[key] for key in ("terminal", "has_nodes", "has_evidence", "frontier_exhausted")) else "FAIL"
+        full_checks = (
+            "terminal", "has_nodes", "has_evidence", "frontier_exhausted",
+            "search_provider_auth_failed", "search_coverage", "evidence_quality",
+            "critical_coverage", "frontier_exhausted_with_failures",
+            "no_unresolved_blocking_contradictions",
+        )
+        failed_checks = [key for key in full_checks if not gate[key]]
+        if missing_required:
+            failed_checks.append("required_capability_unavailable")
+        gate["failed_checks"] = sorted(set(failed_checks))
+        gate["recommended_actions"] = []
+        if not gate["evidence_quality"]:
+            gate["recommended_actions"].append("run_document_extraction")
+        if not gate["critical_coverage"]:
+            gate["recommended_actions"].append("run_identity_candidate_builder")
+        if missing_required:
+            gate["recommended_actions"].append("install_required_typed_worker")
+        full_pass = not gate["failed_checks"] and gate["report_mode"] == "full"
+        partial_pass = (
+            gate["report_mode"] == "partial"
+            and gate["has_nodes"] and gate["has_evidence"]
+            and gate["frontier_exhausted"] and bool(gate["failed_checks"])
+        )
+        gate["result"] = "PASS" if full_pass or partial_pass else "FAIL"
+        gate["partial"] = partial_pass
         if gate["result"] != "PASS":
-            return {"ok": False, "run_id": run_id, "reason": "pre_report_gate_not_satisfied", "gate": gate}
+            provider_readiness = {}
+            try:
+                from tools.companyintel_public_search import provider_readiness as _provider_readiness
+                provider_readiness = _provider_readiness()
+            except Exception:
+                provider_readiness = {"ready": False, "provider": "none"}
+            upstream = (
+                "SEARCH_PROVIDER_UNAVAILABLE"
+                if search_provider_auth_failed or not provider_readiness.get("ready")
+                else "REQUIRED_CAPABILITY_UNAVAILABLE" if missing_required
+                else "INSUFFICIENT_EVIDENCE"
+            )
+            resumable = bool(missing_required or failed_tasks)
+            durable_status = "RESUMABLE" if resumable else "PARTIAL"
+            message = "CompanyIntel pre-report quality gate rejected the collected evidence"
+            return {
+                "ok": False, "run_id": run_id, "reason": "pre_report_gate_not_satisfied",
+                "code": "COMPANYINTEL_REQUIRED_CAPABILITY_UNAVAILABLE" if missing_required else "COMPANYINTEL_INSUFFICIENT_EVIDENCE",
+                "stage": "pre_report", "error": message, "retryable": False,
+                "resumable": resumable, "durable_status": durable_status,
+                "upstream_reason": upstream, "provider_readiness": provider_readiness,
+                "failed_checks": gate["failed_checks"],
+                "missing_capabilities": gate["missing_capabilities"],
+                "recommended_actions": gate["recommended_actions"],
+                "error_detail": {
+                    "code": "COMPANYINTEL_REQUIRED_CAPABILITY_UNAVAILABLE" if missing_required else "COMPANYINTEL_INSUFFICIENT_EVIDENCE",
+                    "stage": "pre_report", "failure_stage": "pre_report", "retryable": False,
+                    "resumable": resumable, "durable_status": durable_status, "message": message,
+                    "upstream_reason": upstream, "failed_checks": gate["failed_checks"],
+                    "missing_capabilities": gate["missing_capabilities"],
+                    "recommended_actions": gate["recommended_actions"], "gate": gate,
+                },
+                "gate": gate,
+            }
         from tools.companyintel_reasoning_controller import CompanyIntelReasoningController
         controller = CompanyIntelReasoningController()
         evidence_ids = [row.get("evidence_id") for row in graph.get("evidence", [])]
@@ -1595,6 +2643,15 @@ def _generate_report(args: dict) -> dict:
         ]
         report_text = str(args.get("report_text", "")).strip()[:200000]
         review_text = str(args.get("review_text", "")).strip()[:50000]
+        review_verdict = str(args.get("review_verdict", "")).strip().upper()[:64]
+        review_findings = args.get("review_findings", [])
+        if not isinstance(review_findings, list):
+            review_findings = []
+        # Legacy/direct callers may provide review text without the new explicit
+        # verdict fields; preserve the historical recorded-review semantics while
+        # keeping all reasoning-enabled reviews explicit and validated.
+        if review_text and not review_verdict:
+            review_verdict = "PASS"
         report_model = str(args.get("model", ""))
         report_provider = str(args.get("provider", ""))
         reasoning_claims = []
@@ -1613,17 +2670,95 @@ def _generate_report(args: dict) -> dict:
                 "contradictions": contradictions,
                 "source_limitations": [row.get("limitation") for row in graph.get("search_log", []) if row.get("limitation")],
             }
-            synthesis = controller.synthesize_report_with_llm(graph_digest=graph_digest)
-            report_text = synthesis["report_text"]
-            reasoning_claims = synthesis["claims"]
+            draft_row = conn.execute(
+                "SELECT draft_json,model,provider,stage FROM report_drafts WHERE run_id=? AND graph_revision=?",
+                (run_id, graph_revision),
+            ).fetchone()
+            draft = None
+            if draft_row and draft_row["stage"] in {"SYNTHESIS_READY", "REVIEW_RUNNING", "REPORT_RETRY_WAIT", "REPORT_RESUMABLE"}:
+                try:
+                    candidate_draft = json.loads(draft_row["draft_json"])
+                    if candidate_draft.get("report_text") and isinstance(candidate_draft.get("claims"), list):
+                        draft = candidate_draft
+                except (TypeError, json.JSONDecodeError):
+                    draft = None
+            if draft is None:
+                report_stage = "report_synthesis"
+                draft_id = _stable_id("draft", run_id, graph_revision)
+                now = _now()
+                conn.execute(
+                    "INSERT OR REPLACE INTO report_drafts(draft_id,run_id,graph_revision,draft_json,model,provider,stage,generated_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (draft_id, run_id, graph_revision, _json({"run_id": run_id, "graph_revision": graph_revision, "report_text": "", "claims": []}), reasoning_model, reasoning_provider, "SYNTHESIS_RUNNING", now, now),
+                )
+                conn.commit()
+                synthesis = controller.synthesize_report_with_llm(graph_digest=graph_digest)
+                report_text = synthesis["report_text"]
+                reasoning_claims = synthesis["claims"]
+                report_model = synthesis["model"]
+                report_provider = synthesis["provider"]
+                now = _now()
+                conn.execute(
+                    "UPDATE report_drafts SET draft_json=?,model=?,provider=?,stage='SYNTHESIS_READY',updated_at=? WHERE run_id=? AND graph_revision=?",
+                    (_json({"run_id": run_id, "graph_revision": graph_revision, "report_text": report_text, "claims": reasoning_claims}), report_model, report_provider, now, run_id, graph_revision),
+                )
+                conn.commit()
+            else:
+                report_text = str(draft["report_text"])[:200000]
+                reasoning_claims = draft["claims"]
+                report_model = str(draft_row["model"] or reasoning_model)
+                report_provider = str(draft_row["provider"] or reasoning_provider)
+            report_stage = "report_review"
+            conn.execute("UPDATE report_drafts SET stage='REVIEW_RUNNING',updated_at=? WHERE run_id=? AND graph_revision=?", (_now(), run_id, graph_revision))
+            conn.commit()
             review = controller.review_report_with_llm(report={
                 **graph_digest,
                 "report_text": report_text,
                 "claims": reasoning_claims,
             })
+            review_verdict = review["verdict"]
+            review_findings = review["findings"]
             review_text = review["review_text"]
             report_model = review["model"]
             report_provider = review["provider"]
+            if review_verdict == "REVISE":
+                revised = controller.revise_report_with_llm(
+                    graph_digest=graph_digest,
+                    report={"report_text": report_text, "claims": reasoning_claims},
+                    findings=review_findings,
+                )
+                report_text = revised["report_text"]
+                reasoning_claims = revised["claims"]
+                report_model = revised["model"]
+                report_provider = revised["provider"]
+                conn.execute(
+                    "UPDATE report_drafts SET draft_json=?,model=?,provider=?,stage='REVIEW_RUNNING',updated_at=? WHERE run_id=? AND graph_revision=?",
+                    (_json({"run_id": run_id, "graph_revision": graph_revision, "report_text": report_text, "claims": reasoning_claims}), report_model, report_provider, _now(), run_id, graph_revision),
+                )
+                conn.commit()
+                review = controller.review_report_with_llm(report={
+                    **graph_digest,
+                    "report_text": report_text,
+                    "claims": reasoning_claims,
+                })
+                review_verdict = review["verdict"]
+                review_findings = review["findings"]
+                review_text = review["review_text"]
+                report_model = review["model"]
+                report_provider = review["provider"]
+            if review_verdict in {"BLOCK", "REVISE"} or (gate.get("partial") and review_verdict != "PASS_WITH_LIMITATIONS"):
+                if gate.get("partial") and review_verdict not in {"BLOCK", "REVISE", "PASS_WITH_LIMITATIONS"}:
+                    code = "COMPANYINTEL_REPORT_REVIEW_BLOCKED"
+                else:
+                    code = "COMPANYINTEL_REVIEW_BLOCKED" if review_verdict == "BLOCK" else "COMPANYINTEL_REVIEW_REVISION_NOT_ACCEPTED"
+                raise OpenRouterClientError(
+                    "CompanyIntel report review did not approve publication",
+                    code=code,
+                    retryable=False,
+                    operation="review_report",
+                    failure_stage="review_gate",
+                )
+        source_limitations = [row.get("limitation") for row in graph.get("search_log", []) if row.get("limitation")]
+        source_limitations.extend(f"CAPABILITY_UNAVAILABLE:{name}" for name in gate.get("missing_capabilities", []))
         artifact = controller.build_report_artifact(
             run_id=run_id,
             graph_revision=graph_revision,
@@ -1631,10 +2766,12 @@ def _generate_report(args: dict) -> dict:
             candidates=candidates,
             contradictions=contradictions,
             unresolved_ambiguity=graph.get("identity_resolution", {}),
-            source_limitations=[row.get("limitation") for row in graph.get("search_log", []) if row.get("limitation")],
+            source_limitations=source_limitations,
             report_text=report_text,
             model=report_model,
             provider=report_provider,
+            review_verdict=review_verdict or ("PASS" if review_text else ""),
+            review_findings=review_findings,
             review_text=review_text,
             gate=gate,
         )
@@ -1646,19 +2783,54 @@ def _generate_report(args: dict) -> dict:
         contradiction_result = controller.analyze_contradictions(run_id=run_id, contradictions=contradictions)
         conn.execute("INSERT OR REPLACE INTO reasoning_decisions(decision_id,run_id,decision_type,decision_json,model,provider,graph_revision,created_at) VALUES(?,?,?,?,?,?,?,?)", (_stable_id("decision", run_id, graph_revision, "COMPARE_CANDIDATES"), run_id, "COMPARE_CANDIDATES", _json(comparison), artifact["model"], artifact["provider"], graph_revision, generated_at))
         conn.execute("INSERT OR REPLACE INTO reasoning_decisions(decision_id,run_id,decision_type,decision_json,model,provider,graph_revision,created_at) VALUES(?,?,?,?,?,?,?,?)", (_stable_id("decision", run_id, graph_revision, "ANALYZE_CONTRADICTIONS"), run_id, "ANALYZE_CONTRADICTIONS", _json(contradiction_result), artifact["model"], artifact["provider"], graph_revision, generated_at))
-        if review_text:
+        if review_text and review_verdict:
             review_id = _stable_id("review", artifact["report_id"], artifact["model"], artifact["provider"])
-            review = {"review_id": review_id, "report_id": artifact["report_id"], "verdict": "RECORDED", "text": review_text, "review_label": artifact["review_label"], "independent_review": False, "model": artifact["model"], "provider": artifact["provider"], "graph_revision": graph_revision}
+            review = {"review_id": review_id, "report_id": artifact["report_id"], "verdict": review_verdict, "findings": review_findings, "text": review_text, "review_label": artifact["review_label"], "independent_review": False, "model": artifact["model"], "provider": artifact["provider"], "graph_revision": graph_revision}
             conn.execute("INSERT OR REPLACE INTO report_reviews(review_id,report_id,run_id,graph_revision,review_json,model,provider,review_label,independent_review,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)", (review_id, artifact["report_id"], run_id, graph_revision, _json(review), artifact["model"], artifact["provider"], artifact["review_label"], 0, generated_at))
+        if args.get("reasoning_enabled"):
+            conn.execute("UPDATE report_drafts SET draft_json=?,model=?,provider=?,stage='REPORT_READY',updated_at=? WHERE run_id=? AND graph_revision=?", (_json({"run_id": run_id, "graph_revision": graph_revision, "report_text": report_text, "claims": reasoning_claims, "review_verdict": review_verdict, "review_findings": review_findings, "review_text": review_text}), artifact["model"], artifact["provider"], _now(), run_id, graph_revision))
         conn.commit()
+        _materialize(conn, run_id)
         return {"ok": True, "run_id": run_id, "report": artifact, "persisted": True}
+    except OpenRouterClientError as exc:
+        conn.rollback()
+        detail = exc.as_dict()
+        detail["stage"] = report_stage
+        retryable = bool(exc.retryable)
+        durable_status = "RETRY_WAIT" if retryable else "RESUMABLE"
+        draft_stage = "REPORT_RETRY_WAIT" if retryable else "REPORT_RESUMABLE"
+        event_name = "run.retry_wait" if retryable else "run.resumable"
+        retry_at = time.time() + max(1.0, min(float(exc.retry_after or 5.0), 300.0)) if retryable else None
+        try:
+            now = _now()
+            draft_id = _stable_id("draft", run_id, graph_revision or "unknown")
+            existing_draft = conn.execute(
+                "SELECT draft_json FROM report_drafts WHERE run_id=? AND graph_revision=?",
+                (run_id, graph_revision),
+            ).fetchone() if graph_revision else None
+            if report_stage == "report_review" and existing_draft is not None:
+                # Preserve the committed synthesis; only its stage changes.
+                conn.execute("UPDATE report_drafts SET stage=?,updated_at=? WHERE run_id=? AND graph_revision=?", (draft_stage, now, run_id, graph_revision))
+            else:
+                conn.execute(
+                    "INSERT OR REPLACE INTO report_drafts(draft_id,run_id,graph_revision,draft_json,model,provider,stage,generated_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (draft_id, run_id, graph_revision or "unknown", _json({"run_id": run_id, "graph_revision": graph_revision, "stage": report_stage}), reasoning_model, reasoning_provider, draft_stage, now, now),
+                )
+            conn.execute("UPDATE run_state SET status=?,retry_at=?,retry_reason=?,checkpoint_reason=?,terminal_reason=NULL,updated_at=? WHERE run_id=? AND status <> 'CANCELLED'", (durable_status, retry_at, detail["message"], report_stage, now, run_id))
+            conn.execute("INSERT OR REPLACE INTO reasoning_decisions(decision_id,run_id,decision_type,decision_json,model,provider,graph_revision,created_at) VALUES(?,?,?,?,?,?,?,?)", (_stable_id("decision", run_id, "REASONING_FAILURE", report_stage, str(exc)), run_id, "REASONING_FAILURE", _json({"error": detail, "reasoning_enabled": bool(args.get("reasoning_enabled")), "operation": report_stage}), reasoning_model, reasoning_provider, graph_revision, now))
+            _append_event_conn(conn, run_id, event_name, {"status": durable_status, "retry_at": retry_at, "retry_reason": detail["message"], "checkpoint_reason": report_stage, "error_detail": detail}, f"report-{event_name.split('.', 1)[1]}:{run_id}:{graph_revision}:{report_stage}")
+            conn.commit()
+            _materialize(conn, run_id)
+        except Exception:
+            conn.rollback()
+        return {"ok": False, "run_id": run_id, "reason": detail["message"], "error": detail["message"], "error_detail": detail, "retryable": retryable, "durable_status": durable_status, "retry_at": retry_at, "stage": report_stage}
     except Exception as exc:
         conn.rollback()
         try:
             failure_text = " ".join(str(exc).split())[:1000]
             conn.execute(
                 "INSERT OR REPLACE INTO reasoning_decisions(decision_id,run_id,decision_type,decision_json,model,provider,graph_revision,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                (_stable_id("decision", run_id, "REASONING_FAILURE", failure_text), run_id, "REASONING_FAILURE", _json({"error": failure_text, "reasoning_enabled": bool(args.get("reasoning_enabled")), "operation": "synthesize_report_or_review"}), "nvidia/nemotron-3-ultra-550b-a55b:free", "openrouter", "", _now()),
+                (_stable_id("decision", run_id, "REASONING_FAILURE", failure_text), run_id, "REASONING_FAILURE", _json({"error": failure_text, "reasoning_enabled": bool(args.get("reasoning_enabled")), "operation": report_stage}), reasoning_model, reasoning_provider, graph_revision, _now()),
             )
             conn.commit()
         except Exception:
@@ -1667,34 +2839,106 @@ def _generate_report(args: dict) -> dict:
     finally:
         conn.close()
 
+def _projection_snapshot(graph: dict) -> dict:
+    """Return the metadata clients need to reject torn or stale projections."""
+    return {
+        "graph_revision": graph.get("graph_revision", ""),
+        "updated_at": graph.get("updated_at"),
+        "projection_source": graph.get("projection_source", "durable"),
+        "execution_generation": int(graph.get("execution_generation", graph.get("research_state", {}).get("execution_generation", 0)) or 0),
+        "resume_generation": int(graph.get("resume_generation", graph.get("research_state", {}).get("resume_generation", 0)) or 0),
+    }
+
+
+def _graph_counts(graph: dict) -> dict:
+    counts = graph.get("counts")
+    if isinstance(counts, dict):
+        return dict(counts)
+    nodes = graph.get("nodes", [])
+    edges = graph.get("edges", [])
+    evidence = graph.get("evidence", [])
+    frontier = graph.get("frontier", [])
+    node_breakdown = Counter(node.get("node_type") for node in nodes)
+    return {
+        "graph_nodes": len(nodes),
+        "graph_edges": len(edges),
+        "evidence": len(evidence),
+        "frontier": len(frontier),
+        "frontier_open": sum(item.get("state") == "OPEN" for item in frontier),
+        "finding_nodes": node_breakdown.get("finding", 0),
+        "candidate_nodes": sum(node_breakdown.get(kind, 0) for kind in ("legal_entity_candidate", "organization_candidate")),
+        "identity_candidates": len(graph.get("identity_candidates", [])),
+    }
+
 
 def _projection(args: dict) -> dict:
     run_id = args["run_id"]
     view = str(args.get("view", "graph")).strip().lower()
     if view not in {"graph", "frontier", "evidence", "report"}:
         raise ValueError("unsupported projection view")
-    conn = _connect(run_id)
-    try:
-        if view == "report":
-            row = conn.execute("SELECT report_json FROM report_artifacts WHERE run_id=? ORDER BY generated_at DESC LIMIT 1", (run_id,)).fetchone()
-            if row:
-                return {"ok": True, "run_id": run_id, "view": view, "data": {"ready": True, "artifact": json.loads(row["report_json"])}}
-    finally:
-        conn.close()
     path = _run_dir(run_id) / "graph.json"
     if not path.exists():
         raise ValueError("run projection is not available")
     graph = json.loads(path.read_text(encoding="utf-8"))
+    snapshot = _projection_snapshot(graph)
+    counts = _graph_counts(graph)
+    conn = _connect(run_id)
+    try:
+        report_row = conn.execute(
+            "SELECT report_json FROM report_artifacts WHERE run_id=? ORDER BY generated_at DESC LIMIT 1",
+            (run_id,),
+        ).fetchone()
+    finally:
+        conn.close()
     if view == "graph":
         return {"ok": True, "run_id": run_id, "view": view, "data": graph}
     if view == "frontier":
-        return {"ok": True, "run_id": run_id, "view": view, "data": {"research_state": graph["research_state"], "frontier": graph["frontier"], "frontier_tasks": graph["frontier_tasks"]}}
+        return {
+            "ok": True, "run_id": run_id, "view": view,
+            "snapshot": snapshot,
+            "data": {
+                "snapshot": snapshot, "counts": counts,
+                "research_state": graph["research_state"],
+                "frontier": graph["frontier"], "frontier_tasks": graph["frontier_tasks"],
+            },
+        }
     if view == "evidence":
-        return {"ok": True, "run_id": run_id, "view": view, "data": {"evidence": graph["evidence"], "search_log": graph["search_log"]}}
+        return {
+            "ok": True, "run_id": run_id, "view": view,
+            "snapshot": snapshot,
+            "data": {
+                "snapshot": snapshot, "counts": counts,
+                "evidence": graph["evidence"], "search_log": graph["search_log"],
+            },
+        }
+    if report_row:
+        return {
+            "ok": True, "run_id": run_id, "view": view,
+            "snapshot": snapshot,
+            "data": {
+                "ready": True, "artifact": json.loads(report_row["report_json"]),
+                "snapshot": snapshot, "counts": counts,
+            },
+        }
     status = graph["research_state"]["status"]
     evidence_count = len(graph["evidence"])
     ready = status == "COMPLETED" and evidence_count > 0 and bool(graph["research_state"].get("saturation_reason"))
-    return {"ok": True, "run_id": run_id, "view": view, "data": {"ready": ready, "status": status, "reason": None if ready else "pre_report_gate_not_satisfied", "summary": {"nodes": len(graph["nodes"]), "edges": len(graph["edges"]), "evidence": evidence_count, "frontier_open": graph["research_state"]["frontier_open"]}, "identity_resolution": graph["identity_resolution"], "identity_candidates": graph["identity_candidates"]}}
+    return {
+        "ok": True, "run_id": run_id, "view": view,
+        "snapshot": snapshot,
+        "data": {
+            "ready": ready, "status": status,
+            "reason": None if ready else "pre_report_gate_not_satisfied",
+            "snapshot": snapshot, "counts": counts,
+            "summary": {
+                "nodes": counts["graph_nodes"], "edges": counts["graph_edges"],
+                "evidence": evidence_count, "frontier_open": counts["frontier_open"],
+                "node_breakdown": graph.get("node_breakdown", {}),
+            },
+            "identity_resolution": graph["identity_resolution"],
+            "identity_candidates": graph["identity_candidates"],
+        },
+    }
 
 
 def _summary(args: dict) -> dict:
@@ -1717,10 +2961,83 @@ def _summary(args: dict) -> dict:
         worker_checkpoints.append(item)
     event_count = conn.execute("SELECT COUNT(*) FROM run_events WHERE run_id=?", (run_id,)).fetchone()[0]
     latest_event = conn.execute("SELECT event_id,event_type,created_at FROM run_events WHERE run_id=? ORDER BY event_id DESC LIMIT 1", (run_id,)).fetchone()
-    result = {"ok": True, "run_id": run_id, "nodes": conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0], "edges": conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0], "evidence": conn.execute("SELECT COUNT(*) FROM evidence").fetchone()[0], "frontier_open": conn.execute("SELECT COUNT(*) FROM frontier WHERE state='OPEN'").fetchone()[0], "search_log": conn.execute("SELECT COUNT(*) FROM search_log").fetchone()[0], "round": row["round"], "status": row["status"], "saturation_reason": row["saturation_reason"], "retry_at": row["retry_at"], "retry_reason": row["retry_reason"], "retry_count": row["retry_count"], "resume_count": row["resume_count"], "event_count": event_count, "latest_event": dict(latest_event) if latest_event else None, "legal_identity_exhaustion": {"status": row["legal_identity_status"], "reason": row["legal_identity_reason"], "checked_at": row["legal_identity_checked_at"], "coverage": json.loads(row["legal_identity_coverage"] or "{}")}, "identity_candidates": identity_candidates, "worker_checkpoints": worker_checkpoints, "budgets": {"max_tasks": row["max_tasks"], "max_searches": row["max_searches"], "max_nodes": row["max_nodes"], "max_edges": row["max_edges"], "deadline_at": row["deadline_at"]}, "usage": {"tasks_executed": row["tasks_executed"], "source_calls": row["source_calls"]}}
+    report_state_row = conn.execute("SELECT graph_revision,model,provider,stage,generated_at,updated_at FROM report_drafts WHERE run_id=? ORDER BY updated_at DESC LIMIT 1", (run_id,)).fetchone()
+    node_count = conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+    edge_count = conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
+    evidence_count = conn.execute("SELECT COUNT(*) FROM evidence").fetchone()[0]
+    frontier_count = conn.execute("SELECT COUNT(*) FROM frontier").fetchone()[0]
+    frontier_open = conn.execute("SELECT COUNT(*) FROM frontier WHERE state='OPEN'").fetchone()[0]
+    search_status_counts = {str(item[0]): int(item[1]) for item in conn.execute("SELECT status,COUNT(*) FROM search_log GROUP BY status").fetchall()}
+    node_breakdown = dict(sorted(Counter(row[0] for row in conn.execute("SELECT node_type FROM nodes")).items()))
+    graph_path = _run_dir(run_id) / "graph.json"
+    graph = {}
+    if graph_path.exists():
+        try:
+            graph = json.loads(graph_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            graph = {}
+    snapshot = _projection_snapshot(graph) if graph else {
+        "graph_revision": row["graph_revision"] or "",
+        "updated_at": row["updated_at"],
+        "projection_source": "durable",
+        "execution_generation": int(row["execution_generation"] or 0),
+        "resume_generation": int(row["execution_generation"] or 0),
+    }
+    generation = int(row["execution_generation"] or 0)
+    result = {
+        "ok": True, "run_id": run_id,
+        "nodes": node_count, "edges": edge_count, "evidence": evidence_count,
+        "frontier": frontier_count, "frontier_open": frontier_open, "search_log": conn.execute("SELECT COUNT(*) FROM search_log").fetchone()[0],
+        "search_status_counts": search_status_counts,
+        "graph_revision": snapshot["graph_revision"], "updated_at": snapshot["updated_at"],
+        "projection_updated_at": snapshot["updated_at"], "projection_source": snapshot["projection_source"],
+        "execution_generation": generation, "resume_generation": generation,
+        "runtime_status": row["status"], "last_stop_reason": row["last_stop_reason"],
+        "checkpoint_reason": row["checkpoint_reason"], "terminal_reason": row["terminal_reason"],
+        "node_breakdown": graph.get("node_breakdown", node_breakdown),
+        "planner": graph.get("planner", {}),
+        "convergence": graph.get("convergence"),
+        "finding_nodes": node_breakdown.get("finding", 0),
+        "candidate_nodes": sum(node_breakdown.get(kind, 0) for kind in ("legal_entity_candidate", "organization_candidate")),
+        "identity_candidate_count": len(identity_candidates),
+        "round": row["round"], "status": row["status"], "saturation_reason": row["saturation_reason"],
+        "retry_at": row["retry_at"], "retry_reason": row["retry_reason"], "retry_count": row["retry_count"],
+        "resume_count": row["resume_count"], "event_count": event_count,
+        "report": dict(report_state_row) if report_state_row else {"stage": "REPORT_PENDING"},
+        "latest_event": dict(latest_event) if latest_event else None,
+        "snapshot": snapshot,
+        "legal_identity_exhaustion": {
+            "status": row["legal_identity_status"], "reason": row["legal_identity_reason"],
+            "checked_at": row["legal_identity_checked_at"],
+            "coverage": json.loads(row["legal_identity_coverage"] or "{}"),
+        },
+        "identity_candidates": identity_candidates, "worker_checkpoints": worker_checkpoints,
+        "budgets": {
+            "max_tasks": row["max_tasks"], "max_searches": row["max_searches"],
+            "max_nodes": row["max_nodes"], "max_edges": row["max_edges"], "deadline_at": row["deadline_at"],
+        },
+        "usage": {"tasks_executed": row["tasks_executed"], "source_calls": row["source_calls"]},
+    }
+    try:
+        from tools.companyintel_public_search import provider_readiness
+        result["provider_readiness"] = provider_readiness()
+    except Exception:
+        result["provider_readiness"] = {"provider": "none", "registered": False, "supports_search": False, "configured": False, "credentials_available": False, "authenticated": False, "reachable": False, "ready": False, "reason": "provider readiness unavailable"}
+    result["coverage"] = {
+        "search_total": sum(search_status_counts.values()),
+        "search_success": sum(count for status, count in search_status_counts.items() if status in {"COMPLETED_WITH_RESULTS", "COMPLETED_ZERO_RESULTS"}),
+        "search_status_counts": search_status_counts,
+        "identity": row["legal_identity_status"],
+        "findings": node_breakdown.get("finding", 0),
+    }
+    result["counts"] = {
+        "graph_nodes": node_count, "graph_edges": edge_count, "evidence": evidence_count,
+        "frontier": frontier_count, "frontier_open": frontier_open,
+        "finding_nodes": result["finding_nodes"], "candidate_nodes": result["candidate_nodes"],
+        "identity_candidates": len(identity_candidates),
+    }
     conn.close()
     return result
-
 
 def companyintel_graph(args: dict, **_kwargs) -> str:
     if not check_companyintel_requirements():
@@ -1754,6 +3071,26 @@ def companyintel_graph(args: dict, **_kwargs) -> str:
         elif action == "summary": result = _summary(args)
         else: raise ValueError("unsupported action")
         return json.dumps(result, ensure_ascii=False)
+    except OpenRouterClientError as exc:
+        detail = exc.as_dict()
+        return json.dumps({
+            "ok": False,
+            "error": str(exc),
+            "error_detail": detail,
+            "retryable": bool(exc.retryable),
+        }, ensure_ascii=False)
+    except CompanyIntelArtifactPublicationError as exc:
+        return json.dumps(
+            {
+                "ok": False,
+                "error": {
+                    "code": "ARTIFACT_ACCESS_POSTCONDITION_FAILED",
+                    "message": "CompanyIntel artifact publication failed.",
+                    "event": exc.event,
+                },
+            },
+            ensure_ascii=False,
+        )
     except Exception as exc:
         return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
 

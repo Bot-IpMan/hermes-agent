@@ -19,13 +19,13 @@ NODE_TYPES = frozenset({
     "domain", "url", "phone", "email", "address", "place", "brand",
     "legal_entity", "legal_entity_candidate", "official_registry", "person", "document", "image",
     "favicon", "marketplace_profile", "social_profile", "analytics_id",
-    "merchant_id", "iban", "legal_id", "product", "organization_candidate",
+    "merchant_id", "iban", "legal_id", "product", "organization_candidate", "finding",
 })
 RELATIONS = frozenset({
     "publishes", "contains", "mentions", "observed_on", "located_at", "operated_by",
     "owned_by", "same_as", "registered_as", "listed_on", "maps_to", "derived_from",
     "mentions_legal_id", "visually_matches", "inventory_discovered", "observed_in",
-    "search_result", "maps_result", "marketplace_result", "document_result",
+    "search_result", "maps_result", "marketplace_result", "document_result", "supports",
 })
 
 
@@ -38,6 +38,7 @@ RELATION_ENDPOINTS: dict[str, tuple[tuple[str, str], ...]] = {
     "maps_result": (("*", "place"),),
     "marketplace_result": (("*", "marketplace_profile"),),
     "document_result": (("*", "document"),),
+    "supports": (("finding", "*"),),
 }
 
 

@@ -25,10 +25,9 @@ _REGISTRY: dict[str, tuple[PivotSpec, ...]] = {
         PivotSpec("exact_search", "public_search", 80, 1),
         PivotSpec("documents", "document_search", 75, 1),
     ),
-    "url": (
-        PivotSpec("exact_search", "public_search", 80, 1),
-        PivotSpec("documents", "document_search", 75, 1),
-    ),
+    # Search results are discovery nodes; each bounded URL extraction is a
+    # separate verification task with redirect/SSRF/MIME limits.
+    "url": (PivotSpec("document_extraction", "document_extraction", 86, 2, source_class="document"),),
     "phone": (
         PivotSpec("exact_search", "public_search", 95, 1),
         PivotSpec("maps", "maps_search", 90, 2),
@@ -63,9 +62,6 @@ _REGISTRY: dict[str, tuple[PivotSpec, ...]] = {
         PivotSpec("documents", "document_search", 75, 1),
         PivotSpec("official_registry", "not_implemented", 95, 3, source_class="registry", implemented=False),
     ),
-    "official_registry": (
-        PivotSpec("official_registry", "not_implemented", 95, 3, source_class="registry", implemented=False),
-    ),
     "person": (
         PivotSpec("exact_search", "public_search", 82, 1),
         PivotSpec("documents", "document_search", 75, 1),
@@ -79,7 +75,7 @@ _REGISTRY: dict[str, tuple[PivotSpec, ...]] = {
         PivotSpec("documents", "document_search", 75, 1),
     ),
     "document": (
-        PivotSpec("document_extraction", "not_implemented", 80, 2, source_class="document", implemented=False),
+        PivotSpec("document_extraction", "document_extraction", 80, 2, source_class="document"),
     ),
     "image": (
         PivotSpec("image_favicon", "not_implemented", 60, 2, source_class="image", implemented=False),

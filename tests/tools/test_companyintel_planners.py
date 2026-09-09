@@ -20,4 +20,4 @@ def test_domain_planner_deduplicates_www_variant():
 def test_wave5_matrix_is_explicitly_fail_closed():
     matrix = source_matrix()
     assert {item.name for item in matrix} >= {"marketplace", "maps", "social", "official_registry", "prozorro_spending"}
-    assert all(not item.implemented and item.outcome == "SKIPPED_UNSUPPORTED" for item in matrix)
+    assert all(not item.implemented and item.outcome == "CAPABILITY_UNAVAILABLE" for item in matrix)
