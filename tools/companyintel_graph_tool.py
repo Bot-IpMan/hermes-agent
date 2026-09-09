@@ -2233,6 +2233,9 @@ def _legal_identity_coverage(conn: sqlite3.Connection, run_id: str) -> dict:
         if any(state in {"OPEN", "CLAIMED", "RETRY_WAIT"} for state in states):
             coverage[coverage_class] = "PENDING"
             continue
+        if any(state in {"BLOCKED_CAPABILITY", "SKIPPED_UNSUPPORTED"} for state in states):
+            coverage[coverage_class] = "UNAVAILABLE"
+            continue
         failures = [str(row["last_error"] or "").lower() for row in rows if row["state"] == "FAILED"]
         if failures:
             text = " ".join(failures)

@@ -77,6 +77,25 @@ def test_init_run_persists_canonical_graph_and_checkpoint(companyintel_home):
     )
 
 
+def test_blocked_capability_is_not_reported_as_completed_zero_results(companyintel_home):
+    from tools.companyintel_graph_tool import companyintel_graph
+
+    run_id = "run_blocked_capability_coverage"
+    init = json.loads(companyintel_graph({
+        "action": "init_run", "run_id": run_id, "target_url": "https://example.com",
+    }))
+    observed = json.loads(companyintel_graph({
+        "action": "record_observation", "run_id": run_id, "node_type": "legal_entity",
+        "value": "Example LLC", "source_url": "https://example.com/about",
+        "excerpt": "Example LLC legal entity", "retrieval_method": "bounded_http_extraction",
+    }))
+    assert observed["ok"] is True
+    result = json.loads(companyintel_graph({
+        "action": "legal_identity_exhaustion", "run_id": run_id,
+    }))
+    assert result["coverage"]["official_registry"] == "UNAVAILABLE"
+
+
 def test_unknown_run_operation_does_not_create_graph_database(companyintel_home):
     from tools.companyintel_graph_tool import companyintel_graph
 
