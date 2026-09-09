@@ -586,6 +586,43 @@ def test_pre_report_gate_rejects_unresolved_candidate_contradiction(companyintel
     assert result["gate"]["blocking_contradiction_count"] == 1
 
 
+def test_partial_report_requires_explicit_review_contract(companyintel_home):
+    from tools.companyintel_graph_tool import _connect, _materialize, companyintel_graph
+
+    run_id = "run_partial_review_contract"
+    init = json.loads(companyintel_graph({"action": "init_run", "run_id": run_id, "target_url": "https://example.com"}))
+    evidence = json.loads(companyintel_graph({
+        "action": "record_observation", "run_id": run_id, "node_type": "email",
+        "value": "info@example.com", "source_url": "https://example.com/contact",
+        "excerpt": "info@example.com", "relation_from_node_id": init["seed_node_id"], "relation": "publishes",
+    }))
+    candidate = json.loads(companyintel_graph({
+        "action": "record_identity_candidate", "run_id": run_id,
+        "candidate_id": "candidate:partial-contract", "legal_name": "Example One",
+        "legal_id": "UA-11111111", "country": "UA",
+        "match_types": ["exact_official_legal_id"], "conflicting_dimensions": ["country"],
+        "evidence_ids": [evidence["evidence_id"]],
+    }))
+    assert candidate["ok"] is True
+    conn = _connect(run_id)
+    conn.execute("UPDATE run_state SET status='COMPLETED',saturation_reason='coverage_complete' WHERE run_id=?", (run_id,))
+    conn.execute("UPDATE frontier SET state='EXHAUSTED'")
+    conn.commit(); _materialize(conn, run_id); conn.close()
+
+    rejected = json.loads(companyintel_graph({
+        "action": "generate_report", "run_id": run_id, "report_mode": "partial",
+        "report_text": "bounded", "review_text": "", "review_verdict": "",
+    }))
+    assert rejected["ok"] is False
+    accepted = json.loads(companyintel_graph({
+        "action": "generate_report", "run_id": run_id, "report_mode": "partial",
+        "report_text": "bounded", "review_text": "limitations reviewed",
+        "review_verdict": "PASS_WITH_LIMITATIONS",
+    }))
+    assert accepted["ok"] is True
+    assert accepted["report"]["gate_result"]["partial"] is True
+
+
 def test_report_artifact_persists_after_gate_and_get_is_read_only(companyintel_home):
     from tools.companyintel_graph_tool import _connect, _materialize, companyintel_graph
 

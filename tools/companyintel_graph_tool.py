@@ -2594,10 +2594,18 @@ def _generate_report(args: dict) -> dict:
         if missing_required:
             gate["recommended_actions"].append("install_required_typed_worker")
         full_pass = not gate["failed_checks"] and gate["report_mode"] == "full"
-        partial_pass = (
+        partial_candidate = (
             gate["report_mode"] == "partial"
             and gate["has_nodes"] and gate["has_evidence"]
             and gate["frontier_exhausted"] and bool(gate["failed_checks"])
+        )
+        # A direct partial publication must carry an explicit limitations
+        # review. Reasoning-enabled runs are allowed to enter review first;
+        # the post-review check below still requires PASS_WITH_LIMITATIONS.
+        partial_pass = partial_candidate and (
+            bool(args.get("reasoning_enabled"))
+            or (str(args.get("review_verdict", "")).strip().upper() == "PASS_WITH_LIMITATIONS"
+                and bool(str(args.get("review_text", "")).strip()))
         )
         gate["result"] = "PASS" if full_pass or partial_pass else "FAIL"
         gate["partial"] = partial_pass
@@ -2748,7 +2756,7 @@ def _generate_report(args: dict) -> dict:
                 review_text = review["review_text"]
                 report_model = review["model"]
                 report_provider = review["provider"]
-            if review_verdict in {"BLOCK", "REVISE"} or (gate.get("partial") and review_verdict != "PASS_WITH_LIMITATIONS"):
+            if review_verdict in {"BLOCK", "REVISE"} or (gate.get("partial") and (review_verdict != "PASS_WITH_LIMITATIONS" or not str(review_text).strip())):
                 if gate.get("partial") and review_verdict not in {"BLOCK", "REVISE", "PASS_WITH_LIMITATIONS"}:
                     code = "COMPANYINTEL_REPORT_REVIEW_BLOCKED"
                 else:
@@ -2761,7 +2769,14 @@ def _generate_report(args: dict) -> dict:
                     failure_stage="review_gate",
                 )
         source_limitations = [row.get("limitation") for row in graph.get("search_log", []) if row.get("limitation")]
+        raw_limitations = args.get("limitations", [])
+        if isinstance(raw_limitations, str):
+            raw_limitations = [raw_limitations]
+        if isinstance(raw_limitations, list):
+            source_limitations.extend(str(item).strip()[:500] for item in raw_limitations if str(item).strip())
         source_limitations.extend(f"CAPABILITY_UNAVAILABLE:{name}" for name in gate.get("missing_capabilities", []))
+        if gate.get("partial"):
+            source_limitations.extend(f"QUALITY_GATE:{name}" for name in gate.get("failed_checks", []))
         artifact = controller.build_report_artifact(
             run_id=run_id,
             graph_revision=graph_revision,
@@ -3101,7 +3116,7 @@ def companyintel_graph(args: dict, **_kwargs) -> str:
 _COMPANYINTEL_GRAPH_SCHEMA = {
     "name": "companyintel_graph",
     "description": "Deterministically persist companyintel graph nodes, evidence, edges and typed frontier. Required for graph state; profile-gated.",
-    "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["init_run", "inventory", "schedule_frontier", "claim_frontier", "renew_frontier", "complete_frontier", "fail_frontier", "checkpoint_worker", "resume_worker", "frontier_status", "execute_frontier", "run_frontier", "reasoning_cycle", "resume_frontier", "exhaustion_gate", "legal_identity_exhaustion", "record_identity_candidate", "record_observation", "record_search", "append_event", "replay_events", "transition_run", "projection", "generate_report", "summary"]}, "run_id": {"type": "string"}, "target_url": {"type": "string"}, "node_type": {"type": "string"}, "value": {"type": "string"}, "source_url": {"type": "string"}, "source_title": {"type": "string"}, "excerpt": {"type": "string"}, "relation_from_node_id": {"type": "string"}, "relation": {"type": "string"}, "worker_id": {"type": "string"}, "task_id": {"type": "string"}, "lease_token": {"type": "string"}, "phase": {"type": "string"}, "cursor": {"type": "object", "additionalProperties": True}, "lease_seconds": {"type": "number"}, "max_attempts": {"type": "integer"}, "retry_after_seconds": {"type": "number"}, "pivot_type": {"type": "string"}, "error": {"type": "string"}, "search_timeout_seconds": {"type": "number"}, "search_max_bytes": {"type": "integer"}, "search_max_results": {"type": "integer"}, "max_urls": {"type": "integer"}, "max_bytes_per_url": {"type": "integer"}, "max_total_bytes": {"type": "integer"}, "event_type": {"type": "string"}, "payload": {"type": "object", "additionalProperties": True}, "idempotency_key": {"type": "string"}, "after_event_id": {"type": "integer"}, "limit": {"type": "integer"}, "status": {"type": "string"}, "reason": {"type": "string"}, "view": {"type": "string", "enum": ["graph", "frontier", "evidence", "report"]}, "report_text": {"type": "string"}, "review_text": {"type": "string"}, "model": {"type": "string"}, "provider": {"type": "string"}}, "required": ["action", "run_id"]},
+    "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["init_run", "inventory", "schedule_frontier", "claim_frontier", "renew_frontier", "complete_frontier", "fail_frontier", "checkpoint_worker", "resume_worker", "frontier_status", "execute_frontier", "run_frontier", "reasoning_cycle", "resume_frontier", "exhaustion_gate", "legal_identity_exhaustion", "record_identity_candidate", "record_observation", "record_search", "append_event", "replay_events", "transition_run", "projection", "generate_report", "summary"]}, "run_id": {"type": "string"}, "target_url": {"type": "string"}, "node_type": {"type": "string"}, "value": {"type": "string"}, "source_url": {"type": "string"}, "source_title": {"type": "string"}, "excerpt": {"type": "string"}, "relation_from_node_id": {"type": "string"}, "relation": {"type": "string"}, "worker_id": {"type": "string"}, "task_id": {"type": "string"}, "lease_token": {"type": "string"}, "phase": {"type": "string"}, "cursor": {"type": "object", "additionalProperties": True}, "lease_seconds": {"type": "number"}, "max_attempts": {"type": "integer"}, "retry_after_seconds": {"type": "number"}, "pivot_type": {"type": "string"}, "error": {"type": "string"}, "search_timeout_seconds": {"type": "number"}, "search_max_bytes": {"type": "integer"}, "search_max_results": {"type": "integer"}, "max_urls": {"type": "integer"}, "max_bytes_per_url": {"type": "integer"}, "max_total_bytes": {"type": "integer"}, "event_type": {"type": "string"}, "payload": {"type": "object", "additionalProperties": True}, "idempotency_key": {"type": "string"}, "after_event_id": {"type": "integer"}, "limit": {"type": "integer"}, "status": {"type": "string"}, "reason": {"type": "string"}, "view": {"type": "string", "enum": ["graph", "frontier", "evidence", "report"]}, "report_text": {"type": "string"}, "review_text": {"type": "string"}, "review_verdict": {"type": "string"}, "report_mode": {"type": "string", "enum": ["full", "partial"]}, "limitations": {"type": "array", "items": {"type": "string"}}, "model": {"type": "string"}, "provider": {"type": "string"}}, "required": ["action", "run_id"]},
 }
 
 registry.register(name="companyintel_graph", toolset="companyintel", schema=_COMPANYINTEL_GRAPH_SCHEMA, handler=companyintel_graph, check_fn=check_companyintel_requirements, description=_COMPANYINTEL_GRAPH_SCHEMA["description"], emoji="🕸️", max_result_size_chars=12000)
