@@ -167,6 +167,27 @@ def reset_client() -> None:
         _close_client(old)
 
 
+def refresh_active_reasoning_credentials() -> bool:
+    """Refresh the active OAuth route after an upstream authentication denial.
+
+    A locally unexpired Codex access token can still be revoked upstream.  Keep
+    this recovery scoped to the configured Codex route; API-key routes never
+    trigger credential rotation here.
+    """
+    provider, _model = get_reasoning_route()
+    if provider != "openai-codex":
+        return False
+    try:
+        from agent.auxiliary_client import _refresh_provider_credentials
+
+        refreshed = bool(_refresh_provider_credentials(provider))
+    except Exception:
+        return False
+    if refreshed:
+        reset_client()
+    return refreshed
+
+
 def get_sync_client():
     """Return the synchronous client for the configured Hermes route."""
     global _client, _client_mode, _client_route

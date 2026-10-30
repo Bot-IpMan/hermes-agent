@@ -84,11 +84,32 @@ def test_auth_failure_is_not_retried(monkeypatch):
     calls = []
     monkeypatch.setattr(module, "get_sync_client", lambda: client)
     monkeypatch.setattr(module, "reset_client", lambda: calls.append("reset"))
+    monkeypatch.setattr(module, "refresh_active_reasoning_credentials", lambda: False)
     with pytest.raises(module.OpenRouterClientError) as caught:
         module.request_json(operation="probe", system="return JSON", payload={}, max_attempts=3)
     assert caught.value.code == "REASONING_AUTH_FAILED"
     assert caught.value.retryable is False
     assert calls == []
+
+
+def test_auth_failure_refreshes_codex_once_before_retry(monkeypatch):
+    from tools import companyintel_openrouter_reasoning as module
+
+    class AuthError(Exception):
+        status_code = 401
+
+    class DeniedCompletions:
+        def create(self, **kwargs):
+            raise AuthError("unauthorized")
+
+    denied = type("Client", (), {"chat": type("Chat", (), {"completions": DeniedCompletions()})()})()
+    clients = iter([denied, type("Client", (), {"chat": type("Chat", (), {"completions": type("Completions", (), {"create": lambda self, **kwargs: _response({"ok": True})})()})()})()])
+    refreshes = []
+    monkeypatch.setattr(module, "get_sync_client", lambda: next(clients))
+    monkeypatch.setattr(module, "refresh_active_reasoning_credentials", lambda: refreshes.append(True) or True)
+
+    assert module.request_json(operation="synthesize_report", system="return JSON", payload={}, max_attempts=2) == {"ok": True}
+    assert refreshes == [True]
 
 
 def test_hypothesis_schema_repair_is_bounded(monkeypatch):
@@ -152,6 +173,25 @@ def test_generic_type_error_is_nonretryable_and_redacted(monkeypatch):
     assert "super-secret-token" not in str(caught.value)
     assert caught.value.error_fingerprint
     assert resets == []
+
+
+def test_report_prompts_require_ukrainian_human_text(monkeypatch):
+    from tools import companyintel_openrouter_reasoning as module
+
+    calls = []
+    monkeypatch.setattr(
+        module,
+        "request_json",
+        lambda **kwargs: calls.append(kwargs) or {"report_text": "звіт", "claims": []},
+    )
+    module.synthesize_report({"run_id": "run-language"})
+    module.review_report({"run_id": "run-language"})
+
+    assert len(calls) == 2
+    for call in calls:
+        assert "українською мовою" in call["system"]
+        assert "evidence_ids" in call["system"]
+        assert "URLs" in call["system"]
 
 
 def test_controller_uses_operation_specific_token_limits(monkeypatch):

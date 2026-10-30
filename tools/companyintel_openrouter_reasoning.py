@@ -18,6 +18,7 @@ from tools.openrouter_client import (
     OpenRouterClientError,
     get_active_reasoning_route,
     get_sync_client,
+    refresh_active_reasoning_credentials,
     reset_client,
 )
 
@@ -325,6 +326,7 @@ def request_json(*, operation: str, system: str, payload: dict[str, Any], max_at
     output_tokens = max(1, min(_MAX_OUTPUT_TOKENS, int(max_tokens)))
     deadline = time.monotonic() + max(1.0, min(float(deadline_seconds), _DEFAULT_DEADLINE_SECONDS))
     last: OpenRouterClientError | None = None
+    auth_refresh_attempted = False
     for attempt in range(1, attempts + 1):
         started = time.monotonic()
         try:
@@ -349,6 +351,15 @@ def request_json(*, operation: str, system: str, payload: dict[str, Any], max_at
             )
         _attempt_event(operation=operation, payload=payload, attempt=attempt,
                        duration_ms=round((time.monotonic() - started) * 1000), result="failure", error=last)
+        if (
+            last is not None
+            and last.code == "REASONING_AUTH_FAILED"
+            and not auth_refresh_attempted
+            and attempt < attempts
+        ):
+            auth_refresh_attempted = True
+            if refresh_active_reasoning_credentials():
+                continue
         if last is None or not last.retryable or attempt >= attempts:
             break
         reset_client()
@@ -370,9 +381,17 @@ _SYSTEM = (
     "run status, graph integrity, evidence IDs, frontier counts, saturation, or terminal state."
 )
 
+# The dashboard renders ``report_text`` verbatim. Keep the language contract in
+# the model-facing prompt rather than attempting lossy UI-side translation.
+_REPORT_UKRAINIAN = (
+    " Write all human-readable report_text, review_text, claim text, and finding "
+    "messages in Ukrainian (українською мовою). Preserve URLs, evidence_ids, "
+    "quoted source text, brand names, and legal names exactly as observed."
+)
+
 
 def synthesize_report(payload: dict[str, Any]) -> dict[str, Any]:
-    return request_json(operation="synthesize_report", system=_SYSTEM + " Synthesize only from the validated graph digest and cite evidence_ids for factual claims.", payload=payload, max_tokens=5000)
+    return request_json(operation="synthesize_report", system=_SYSTEM + _REPORT_UKRAINIAN + " Synthesize only from the validated graph digest and cite evidence_ids for factual claims.", payload=payload, max_tokens=5000)
 
 
 _REVIEW_CONTRACT = (
@@ -388,7 +407,7 @@ _REVIEW_CONTRACT = (
 
 
 def review_report(payload: dict[str, Any]) -> dict[str, Any]:
-    return request_json(operation="review_report", system=_SYSTEM + _REVIEW_CONTRACT + " Mark same-model review as non-independent.", payload=payload, max_tokens=3000)
+    return request_json(operation="review_report", system=_SYSTEM + _REPORT_UKRAINIAN + _REVIEW_CONTRACT + " Mark same-model review as non-independent.", payload=payload, max_tokens=3000)
 
 
 def propose_hypotheses(payload: dict[str, Any]) -> dict[str, Any]:
